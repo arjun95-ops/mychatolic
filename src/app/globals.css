@@ -1,0 +1,329 @@
+@import "tailwindcss" source(none);
+@import "tw-animate-css";
+@source "../**/*.{js,ts,jsx,tsx,mdx}";
+
+@custom-variant dark (&:is([data-theme="dark"] *, .dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-action: var(--action);
+  --color-user-chat: var(--user-chat);
+  --color-success: var(--success);
+  --color-pending: var(--pending);
+  --color-error: var(--error);
+  --color-disabled: var(--disabled);
+  --color-brand-deep: var(--brand-deep);
+  --color-primary-hover: var(--primary-hover);
+  --font-sans: var(--font-outfit);
+  --font-mono: var(--font-jetbrains);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root,
+:root[data-theme='light'],
+.light {
+  --radius: 0.625rem;
+
+  /* Light Mode palette (source: user-provided spec) */
+  --bg: #f5f5f5;
+  --surface: #ffffff;
+  --surface-2: #efefef;
+  --border: rgb(43 45 48 / 26%);
+  --brand: #1f5d8c;
+  --primary: #1f5d8c;
+  --link: #4a90e2;
+  --text: #1a1a1a;
+  --text-muted: #666666;
+  --text-invert: #ffffff;
+  --input-bg: #ffffff;
+  --input-border: rgb(43 45 48 / 25%);
+  --input-focus: #1f5d8c;
+  --success: #2e7d32;
+  --pending: #4a90e2;
+  --error: #c0392b;
+  --disabled: #bdbdbd;
+
+  /* App token mapping */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--surface);
+  --popover-foreground: var(--text);
+  --primary-hover: #174a70;
+  --primary-foreground: #ffffff;
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--link);
+  --accent-foreground: #ffffff;
+  --destructive: var(--error);
+  --destructive-foreground: #ffffff;
+  --input: var(--input-bg);
+  --ring: var(--input-focus);
+  --chart-1: var(--primary);
+  --chart-2: var(--link);
+  --chart-3: var(--success);
+  --chart-4: var(--error);
+  --chart-5: #7ea8cf;
+  --sidebar: var(--surface);
+  --sidebar-foreground: var(--text);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: var(--surface-2);
+  --sidebar-accent-foreground: var(--text);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+  --action: var(--brand);
+  --user-chat: var(--link);
+  --brand-deep: var(--brand);
+  --grid-color: rgb(43 45 48 / 7%);
+  --signature-gradient: linear-gradient(135deg, #1f5d8c, #4a90e2, #1f5d8c);
+}
+
+:root[data-theme='dark'],
+.dark {
+  /* Dark Mode palette (source: user-provided spec) */
+  --bg: #141414;
+  --surface: #141414;
+  --surface-2: #1c1c1c;
+  --border: #2b2d30;
+  --brand: #1f5d8c;
+  --primary: #1f5d8c;
+  --link: #4a90e2;
+  --text: #ffffff;
+  --text-muted: #bdbdbd;
+  --text-invert: #141414;
+  --input-bg: #141414;
+  --input-border: #2b2d30;
+  --input-focus: #1f5d8c;
+  --success: #2e7d32;
+  --pending: #4a90e2;
+  --error: #c0392b;
+  --disabled: #bdbdbd;
+
+  /* App token mapping */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--surface);
+  --card-foreground: var(--text);
+  --popover: var(--surface);
+  --popover-foreground: var(--text);
+  --primary-hover: #2b6fa0;
+  --primary-foreground: #ffffff;
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--link);
+  --accent-foreground: #ffffff;
+  --destructive: var(--error);
+  --destructive-foreground: #ffffff;
+  --input: var(--input-bg);
+  --ring: var(--input-focus);
+  --chart-1: var(--primary);
+  --chart-2: var(--link);
+  --chart-3: var(--success);
+  --chart-4: var(--error);
+  --chart-5: #7ea8cf;
+  --sidebar: var(--surface);
+  --sidebar-foreground: var(--text);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: var(--surface-2);
+  --sidebar-accent-foreground: var(--text);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+  --action: var(--brand);
+  --user-chat: var(--link);
+  --brand-deep: var(--brand);
+  --grid-color: rgb(43 45 48 / 22%);
+  --signature-gradient: linear-gradient(135deg, #1f5d8c, #4a90e2, #1f5d8c);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body {
+    min-height: 100%;
+  }
+  body {
+    @apply bg-background font-sans text-foreground;
+    font-family: var(--font-outfit), "Segoe UI", system-ui, -apple-system, sans-serif;
+    background-color: var(--background);
+    background-image:
+      linear-gradient(to right, var(--grid-color) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-color) 1px, transparent 1px);
+    background-size: 24px 24px;
+    background-attachment: fixed;
+  }
+}
+
+@layer utilities {
+  .signature-gradient {
+    background-image: var(--signature-gradient);
+  }
+
+  .text-signature-gradient {
+    background-image: var(--signature-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+@keyframes chatBubbleEnterMine {
+  0% {
+    opacity: 0;
+    transform: translate3d(18px, 8px, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes chatBubbleEnterOther {
+  0% {
+    opacity: 0;
+    transform: translate3d(-18px, 8px, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.composer-chip-enter {
+  animation: chatBubbleEnterOther 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transform-origin: left center;
+}
+
+.chat-bubble-enter-mine {
+  animation: chatBubbleEnterMine 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transform-origin: right bottom;
+}
+
+.chat-bubble-enter-other {
+  animation: chatBubbleEnterOther 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transform-origin: left bottom;
+}
+
+.chat-bubble-interactive {
+  will-change: transform, box-shadow, filter;
+  transition:
+    transform 180ms ease,
+    box-shadow 220ms ease,
+    filter 220ms ease;
+}
+
+.chat-bubble-interactive:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.02);
+}
+
+.chat-bubble-interactive:active {
+  transform: translateY(0) scale(0.995);
+}
+
+.chat-bubble-mine:hover {
+  box-shadow: 0 10px 24px rgb(155 96 245 / 33%);
+}
+
+.chat-bubble-other:hover {
+  box-shadow: 0 10px 24px rgb(0 0 0 / 28%);
+}
+
+@keyframes authFadeUp {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 20px, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes authOrbFloat {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -14px, 0);
+  }
+}
+
+.auth-fade-up {
+  animation: authFadeUp 420ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+.auth-fade-up-delay {
+  animation-delay: 110ms;
+}
+
+.auth-orb-float {
+  animation: authOrbFloat 7.5s ease-in-out infinite;
+}
+
+.auth-orb-float-delay {
+  animation-delay: 1.8s;
+}
+
+.auth-orb-float-slow {
+  animation-duration: 9.6s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-fade-up,
+  .auth-orb-float {
+    animation: none;
+  }
+
+  .chat-bubble-enter-mine,
+  .chat-bubble-enter-other,
+  .composer-chip-enter {
+    animation: none;
+  }
+
+  .chat-bubble-interactive {
+    transition: none;
+  }
+}
