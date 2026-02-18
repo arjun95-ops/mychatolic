@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { format } from 'date-fns';
 import { id } from 'date-fns/locale';
-import { useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   Calendar,
   CheckCircle2,
@@ -32,7 +32,7 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { useAuth } from '@/lib/features/auth/use-auth';
-import { useChurches } from '@/lib/features/schedule/use-schedule';
+import { useChurches, useMassSchedules } from '@/lib/features/schedule/use-schedule';
 import { supabase } from '@/lib/supabase/client';
 import { cn, createRandomUUID } from '@/lib/utils';
 
@@ -91,6 +91,16 @@ type ActiveCheckIn = {
 };
 
 type RadarMembershipStatus = 'JOINED' | 'PENDING';
+type PublicFilter = 'today' | 'tomorrow' | 'week' | 'all';
+type PublicSort = 'soonest' | 'popular';
+
+type CheckInPresenceItem = {
+  userId: string;
+  fullName?: string;
+  username?: string;
+  avatarUrl?: string;
+  checkAt?: string;
+};
 
 function isMissingColumnError(message: string) {
   const lower = message.toLowerCase();
@@ -179,6 +189,13 @@ function toLocalDateTimeValue(value: Date) {
   const hour = `${value.getHours()}`.padStart(2, '0');
   const minute = `${value.getMinutes()}`.padStart(2, '0');
   return `${year}-${month}-${date}T${hour}:${minute}`;
+}
+
+function toLocalDateValue(value: Date) {
+  const year = value.getFullYear();
+  const month = `${value.getMonth() + 1}`.padStart(2, '0');
+  const date = `${value.getDate()}`.padStart(2, '0');
+  return `${year}-${month}-${date}`;
 }
 
 function formatDateTimeLabel(value?: string) {
@@ -556,6 +573,85 @@ async function getOwnerRadarEvents(userId?: string) {
       } satisfies RadarCardItem;
     })
     .sort((a, b) => new Date(b.startsAt || '').getTime() - new Date(a.startsAt || '').getTime());
+}
+
+async function getRadarEventById(radarId?: string): Promise<RadarCardItem | null> {
+  const id = radarId?.trim();
+  if (!id) return null;
+
+  const legacyWithChurch = await supabase
+    .from('radar_events')
+    .select('id, title, description, event_time, max_participants, church_id, creator_id, allow_member_invite, status, church_name')
+    .eq('id', id)
+    .maybeSingle();
+
+  const legacy =
+    legacyWithChurch.error && isMissingColumnError(legacyWithChurch.error.message)
+      ? await supabase
+          .from('radar_events')
+          .select('id, title, description, event_time, max_participants, church_id, creator_id, allow_member_invite, status')
+          .eq('id', id)
+          .maybeSingle()
+      : legacyWithChurch;
+
+  const v2WithChurch = await supabase
+    .from('radar_events_v2')
+    .select('id, title, description, event_starts_at_utc, max_participants, church_id, creator_id, allow_member_invite, status, church_name')
+    .eq('id', id)
+    .maybeSingle();
+  const v2 =
+    v2WithChurch.error && isMissingColumnError(v2WithChurch.error.message)
+      ? await supabase
+          .from('radar_events_v2')
+          .select('id, title, description, event_starts_at_utc, max_participants, church_id, creator_id, allow_member_invite, status')
+          .eq('id', id)
+          .maybeSingle()
+      : v2WithChurch;
+
+  let row: Record<string, unknown> | null = null;
+  let source: RadarSource | null = null;
+  if (!v2.error && v2.data?.id) {
+    row = v2.data as Record<string, unknown>;
+    source = 'v2';
+  } else if (!legacy.error && legacy.data?.id) {
+    row = legacy.data as Record<string, unknown>;
+    source = 'legacy';
+  }
+
+  if (!row || !source) {
+    return null;
+  }
+
+  const churchId = row.church_id?.toString() || '';
+  let churchName = row.church_name?.toString() || '';
+  if (!churchName && churchId) {
+    const churchResult = await supabase
+      .from('churches')
+      .select('id, name')
+      .eq('id', churchId)
+      .maybeSingle();
+    if (!churchResult.error && churchResult.data?.id) {
+      churchName = churchResult.data.name?.toString() || '';
+    }
+  }
+
+  const participantRows = await fetchRadarParticipantRows([id]);
+  const participantCount = participantRows.filter((item) => item.radar_id?.toString() === id).length;
+  return {
+    id,
+    title: row.title?.toString() || 'Radar Misa',
+    description: row.description?.toString(),
+    startsAt: row.event_starts_at_utc?.toString() || row.event_time?.toString(),
+    maxParticipants: Number(row.max_participants ?? 0) || undefined,
+    participantCount,
+    churchId: churchId || undefined,
+    churchName: churchName || undefined,
+    creatorId: row.creator_id?.toString(),
+    allowMemberInvite:
+      typeof row.allow_member_invite === 'boolean' ? row.allow_member_invite : undefined,
+    status: row.status?.toString(),
+    source,
+  } satisfies RadarCardItem;
 }
 
 async function getLastCheckIn(userId?: string) {
@@ -1060,9 +1156,33 @@ async function setCheckInNow(params: {
   churchId: string;
   countryId?: string;
   dioceseId?: string;
+  massScheduleId?: string;
+  checkinDate?: string;
+  massTime?: string;
+  churchTimezone?: string;
 }) {
-  const { userId, churchId, countryId, dioceseId } = params;
+  const {
+    userId,
+    churchId,
+    countryId,
+    dioceseId,
+    massScheduleId,
+    checkinDate,
+    massTime,
+    churchTimezone,
+  } = params;
   const nowIso = new Date().toISOString();
+  const selectedDate = (checkinDate || nowIso.split('T')[0]).trim();
+  const selectedMassTime = massTime?.trim() || '';
+  const timeParts = selectedMassTime.match(/^(\d{1,2}):(\d{2})/);
+  let massDateTimeIso = nowIso;
+  if (timeParts) {
+    const massDate = new Date(`${selectedDate}T${timeParts[1].padStart(2, '0')}:${timeParts[2]}:00`);
+    if (!Number.isNaN(massDate.getTime())) {
+      massDateTimeIso = massDate.toISOString();
+    }
+  }
+  const resolvedChurchTimezone = (churchTimezone || 'Asia/Jakarta').trim() || 'Asia/Jakarta';
 
   const archivePayload: Record<string, unknown> = {
     status: 'ARCHIVED',
@@ -1099,10 +1219,10 @@ async function setCheckInNow(params: {
       p_country_id: countryId,
       p_diocese_id: dioceseId,
       p_church_id: churchId,
-      p_mass_schedule_id: null,
-      p_checkin_date: nowIso.split('T')[0],
+      p_mass_schedule_id: massScheduleId || null,
+      p_checkin_date: selectedDate,
       p_visibility: 'PUBLIC',
-      p_church_timezone: 'Asia/Jakarta',
+      p_church_timezone: resolvedChurchTimezone,
     });
 
     if (!rpcResult.error) {
@@ -1122,7 +1242,7 @@ async function setCheckInNow(params: {
     user_id: userId,
     church_id: churchId,
     check_in_time: nowIso,
-    mass_time: nowIso,
+    mass_time: massDateTimeIso,
     visibility: 'PUBLIC',
     status: 'ACTIVE',
   };
@@ -1136,8 +1256,8 @@ async function setCheckInNow(params: {
     user_id: userId,
     church_id: churchId,
     checkin_at: nowIso,
-    checkin_date: nowIso.split('T')[0],
-    church_timezone: 'Asia/Jakarta',
+    checkin_date: selectedDate,
+    church_timezone: resolvedChurchTimezone,
     visibility: 'PUBLIC',
     status: 'ACTIVE',
   };
@@ -1147,6 +1267,9 @@ async function setCheckInNow(params: {
   }
   if (dioceseId) {
     v2Payload.diocese_id = dioceseId;
+  }
+  if (massScheduleId) {
+    v2Payload.mass_schedule_id = massScheduleId;
   }
 
   const v2Insert = await insertWithColumnFallback('mass_checkins_v2', v2Payload);
@@ -1199,6 +1322,101 @@ async function setCheckOutNow(params: { userId: string; active: ActiveCheckIn })
   }
 
   throw new Error('Gagal check-out sekarang.');
+}
+
+async function getCheckInPresence(params: {
+  churchId?: string;
+  currentUserId?: string;
+  limit?: number;
+}): Promise<CheckInPresenceItem[]> {
+  const { churchId, currentUserId, limit = 8 } = params;
+  const selectedChurchId = churchId?.trim();
+  if (!selectedChurchId) return [];
+
+  const byUser = new Map<string, { userId: string; checkAt?: string }>();
+
+  for (const table of ['mass_checkins', 'mass_checkins_v2']) {
+    const withStatus = await supabase
+      .from(table)
+      .select('user_id, checkin_at, check_in_time, mass_time, created_at, status')
+      .eq('church_id', selectedChurchId)
+      .eq('status', 'ACTIVE')
+      .order('created_at', { ascending: false })
+      .limit(80);
+
+    let rows = withStatus.data as Record<string, unknown>[] | null;
+    let resultError = withStatus.error;
+    let usedStatusFilter = true;
+
+    if (resultError && isMissingColumnError(resultError.message)) {
+      const fallback = await supabase
+        .from(table)
+        .select('user_id, checkin_at, check_in_time, mass_time, created_at')
+        .eq('church_id', selectedChurchId)
+        .order('created_at', { ascending: false })
+        .limit(80);
+      rows = fallback.data as Record<string, unknown>[] | null;
+      resultError = fallback.error;
+      usedStatusFilter = false;
+    }
+
+    if (resultError) {
+      if (!isPermissionError(resultError.message)) {
+        console.error(`Error fetching check-in presence from ${table}:`, resultError);
+      }
+      continue;
+    }
+
+    for (const row of (rows ?? []) as Record<string, unknown>[]) {
+      const userId = row.user_id?.toString();
+      if (!userId || userId === currentUserId) continue;
+
+      const checkAt =
+        row.checkin_at?.toString() ||
+        row.check_in_time?.toString() ||
+        row.mass_time?.toString() ||
+        row.created_at?.toString();
+      if (!checkAt) continue;
+
+      const checkTime = new Date(checkAt).getTime();
+      if (Number.isNaN(checkTime)) continue;
+      if (!usedStatusFilter) {
+        // Legacy fallback without status can include stale rows.
+        if (checkTime < Date.now() - 6 * 60 * 60 * 1000) {
+          continue;
+        }
+      }
+
+      const existing = byUser.get(userId);
+      if (!existing) {
+        byUser.set(userId, { userId, checkAt });
+        continue;
+      }
+
+      const existingTime = new Date(existing.checkAt || '').getTime();
+      if (Number.isNaN(existingTime) || checkTime > existingTime) {
+        byUser.set(userId, { userId, checkAt });
+      }
+    }
+  }
+
+  const ordered = Array.from(byUser.values())
+    .sort((a, b) => new Date(b.checkAt || '').getTime() - new Date(a.checkAt || '').getTime())
+    .slice(0, Math.max(1, limit));
+
+  if (ordered.length === 0) return [];
+
+  const profiles = await getProfilesMap(ordered.map((item) => item.userId));
+  return ordered.map((item) => {
+    const profile = profiles.get(item.userId);
+    return {
+      userId: item.userId,
+      fullName: profile?.full_name,
+      username: profile?.username,
+      avatarUrl: profile?.avatar_url,
+      checkAt: item.checkAt,
+    } satisfies CheckInPresenceItem;
+  });
 }
 
 async function searchInviteTargets(keyword: string, currentUserId?: string) {
@@ -1320,6 +1538,39 @@ async function sendRadarInvite(params: {
     const isHost = creatorId === inviterId;
     if (!isHost && !allowMemberInvite) {
       throw new Error('Host tidak mengizinkan undangan peserta pada radar ini.');
+    }
+    if (!isHost && allowMemberInvite) {
+      const participantTables =
+        radar.source === 'v2'
+          ? (['radar_participants_v2', 'radar_participants'] as const)
+          : (['radar_participants', 'radar_participants_v2'] as const);
+
+      let inviterIsJoinedMember = false;
+      for (const table of participantTables) {
+        const participant = await supabase
+          .from(table)
+          .select('status')
+          .eq('radar_id', radar.id)
+          .eq('user_id', inviterId)
+          .maybeSingle();
+
+        if (participant.error) {
+          if (!isMissingColumnError(participant.error.message) && !isPermissionError(participant.error.message)) {
+            throw new Error(participant.error.message);
+          }
+          continue;
+        }
+        if (!participant.data) continue;
+        const memberStatus = normalizeMembershipStatus(participant.data.status);
+        if (isJoinedMembershipStatus(memberStatus) || !memberStatus) {
+          inviterIsJoinedMember = true;
+          break;
+        }
+      }
+
+      if (!inviterIsJoinedMember) {
+        throw new Error('Anda harus bergabung dulu ke radar sebelum mengundang user lain.');
+      }
     }
   }
 
@@ -1926,6 +2177,7 @@ async function respondToRadarInvite(params: {
 }
 
 export default function RadarPage() {
+  const router = useRouter();
   const queryClient = useQueryClient();
   const searchParams = useSearchParams();
   const { user, profile } = useAuth();
@@ -1935,6 +2187,9 @@ export default function RadarPage() {
   const requestedTab = searchParams.get('tab');
   const targetIdFromQuery = searchParams.get('targetId')?.trim() ?? '';
   const targetNameFromQuery = searchParams.get('targetName')?.trim() ?? '';
+  const radarIdFromQuery = searchParams.get('radarId')?.trim() ?? '';
+  const openCheckinFromQuery = searchParams.get('openCheckin') === '1';
+  const openCreateFromQuery = searchParams.get('openCreate') === '1';
   const normalizedRequestedTab =
     requestedTab === 'ajak' || requestedTab === 'riwayat' || requestedTab === 'cari'
       ? requestedTab
@@ -1943,10 +2198,13 @@ export default function RadarPage() {
         : 'cari';
 
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
+  const [isCheckInDialogOpen, setIsCheckInDialogOpen] = useState(false);
   const [isSubmittingCreate, setIsSubmittingCreate] = useState(false);
   const [isCheckingIn, setIsCheckingIn] = useState(false);
   const [joiningRadarId, setJoiningRadarId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'cari' | 'riwayat' | 'ajak'>(normalizedRequestedTab);
+  const [publicFilter, setPublicFilter] = useState<PublicFilter>('all');
+  const [publicSort, setPublicSort] = useState<PublicSort>('soonest');
 
   const [createTitle, setCreateTitle] = useState('');
   const [createDescription, setCreateDescription] = useState('');
@@ -1965,6 +2223,9 @@ export default function RadarPage() {
     toLocalDateTimeValue(new Date(Date.now() + 24 * 60 * 60 * 1000))
   );
   const [personalMessage, setPersonalMessage] = useState('Mengajak Anda Misa bersama');
+  const [checkInChurchId, setCheckInChurchId] = useState('');
+  const [checkInDate, setCheckInDate] = useState(toLocalDateValue(new Date()));
+  const [checkInScheduleId, setCheckInScheduleId] = useState('');
 
   useEffect(() => {
     setActiveTab(normalizedRequestedTab);
@@ -1974,6 +2235,11 @@ export default function RadarPage() {
     if (!targetNameFromQuery) return;
     setInviteKeyword((current) => current || targetNameFromQuery);
   }, [targetNameFromQuery]);
+  useEffect(() => {
+    if (!openCreateFromQuery) return;
+    if (!canCreateRadar) return;
+    setIsCreateDialogOpen(true);
+  }, [canCreateRadar, openCreateFromQuery]);
 
   useEffect(() => {
     if (!createChurchId && churches.length > 0) {
@@ -1991,6 +2257,17 @@ export default function RadarPage() {
       : churches[0].id;
     setPersonalChurchId(preferredChurch || '');
   }, [churches, personalChurchId, profile?.church_id]);
+  useEffect(() => {
+    if (checkInChurchId || !churches.length) return;
+    const preferredChurch =
+      profile?.church_id && churches.some((church) => church.id === profile.church_id)
+        ? profile.church_id
+        : churches[0].id;
+    setCheckInChurchId(preferredChurch || '');
+  }, [churches, checkInChurchId, profile?.church_id]);
+  useEffect(() => {
+    setCheckInScheduleId('');
+  }, [checkInChurchId, checkInDate]);
 
   const { data: events = [], isLoading } = useQuery({
     queryKey: ['radar-events', user?.id],
@@ -2015,8 +2292,23 @@ export default function RadarPage() {
     enabled: Boolean(user?.id),
     refetchInterval: 60_000,
   });
+  const { data: focusedRadar, isLoading: isLoadingFocusedRadar } = useQuery({
+    queryKey: ['radar-by-id', radarIdFromQuery],
+    queryFn: () => getRadarEventById(radarIdFromQuery),
+    enabled: radarIdFromQuery.length > 0,
+    staleTime: 60_000,
+  });
+  const { data: checkInSchedules = [], isLoading: isLoadingCheckInSchedules } = useMassSchedules({
+    churchId: checkInChurchId || undefined,
+  });
 
-  const eventIds = useMemo(() => events.map((event) => event.id), [events]);
+  const eventIds = useMemo(() => {
+    const ids = events.map((event) => event.id);
+    if (focusedRadar?.id && !ids.includes(focusedRadar.id)) {
+      ids.push(focusedRadar.id);
+    }
+    return ids;
+  }, [events, focusedRadar?.id]);
   const { data: radarMembershipMap = {} } = useQuery({
     queryKey: ['radar-membership-map', user?.id, eventIds],
     queryFn: () => getRadarMembershipMap(user?.id, eventIds),
@@ -2055,17 +2347,98 @@ export default function RadarPage() {
     if (upcomingEvents[0]?.churchId) return upcomingEvents[0].churchId;
     return churches[0]?.id;
   }, [churches, profile?.church_id, upcomingEvents]);
+  useEffect(() => {
+    if (!openCheckinFromQuery) return;
+    if (activeCheckIn) return;
+    const fallbackChurchId = defaultCheckInChurchId || churches[0]?.id || '';
+    if (!fallbackChurchId) return;
+    setCheckInChurchId((current) => current || fallbackChurchId);
+    setCheckInDate(toLocalDateValue(new Date()));
+    setIsCheckInDialogOpen(true);
+  }, [activeCheckIn, churches, defaultCheckInChurchId, openCheckinFromQuery]);
+  const checkInDayOfWeek = useMemo(() => {
+    const date = new Date(`${checkInDate}T00:00:00`);
+    if (Number.isNaN(date.getTime())) return new Date().getDay();
+    return date.getDay();
+  }, [checkInDate]);
+  const scheduleOptionsForDate = useMemo(
+    () =>
+      checkInSchedules.filter(
+        (schedule) =>
+          Number(schedule.day_of_week ?? -1) === checkInDayOfWeek
+      ),
+    [checkInDayOfWeek, checkInSchedules]
+  );
+  const selectedCheckInSchedule = useMemo(
+    () =>
+      scheduleOptionsForDate.find((schedule) => schedule.id === checkInScheduleId) ||
+      null,
+    [checkInScheduleId, scheduleOptionsForDate]
+  );
+  useEffect(() => {
+    if (checkInScheduleId || scheduleOptionsForDate.length !== 1) return;
+    setCheckInScheduleId(scheduleOptionsForDate[0].id);
+  }, [checkInScheduleId, scheduleOptionsForDate]);
+  const filteredUpcomingEvents = useMemo(() => {
+    const now = new Date();
+    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startTomorrow = new Date(startToday);
+    startTomorrow.setDate(startTomorrow.getDate() + 1);
+    const startAfterTomorrow = new Date(startTomorrow);
+    startAfterTomorrow.setDate(startAfterTomorrow.getDate() + 1);
+    const startNextWeek = new Date(startToday);
+    startNextWeek.setDate(startNextWeek.getDate() + 7);
+
+    const filtered = upcomingEvents.filter((event) => {
+      if (!event.startsAt) return publicFilter === 'all';
+      const startsAt = new Date(event.startsAt);
+      if (Number.isNaN(startsAt.getTime())) return publicFilter === 'all';
+      if (publicFilter === 'today') {
+        return startsAt >= startToday && startsAt < startTomorrow;
+      }
+      if (publicFilter === 'tomorrow') {
+        return startsAt >= startTomorrow && startsAt < startAfterTomorrow;
+      }
+      if (publicFilter === 'week') {
+        return startsAt >= startToday && startsAt < startNextWeek;
+      }
+      return true;
+    });
+
+    const sorted = [...filtered];
+    if (publicSort === 'popular') {
+      sorted.sort((a, b) => {
+        const participantDiff = (b.participantCount || 0) - (a.participantCount || 0);
+        if (participantDiff !== 0) return participantDiff;
+        return new Date(a.startsAt || '').getTime() - new Date(b.startsAt || '').getTime();
+      });
+      return sorted;
+    }
+
+    sorted.sort((a, b) => new Date(a.startsAt || '').getTime() - new Date(b.startsAt || '').getTime());
+    return sorted;
+  }, [publicFilter, publicSort, upcomingEvents]);
 
   const inviteRadarOptions = useMemo(() => {
     const upcomingMine = ownerHistoryEvents.filter((event) => {
       if (!event.startsAt) return true;
       return new Date(event.startsAt).getTime() >= Date.now() - 24 * 60 * 60 * 1000;
     });
-    if (upcomingMine.length > 0) return upcomingMine;
-    if (ownerHistoryEvents.length > 0) return ownerHistoryEvents;
-    if (upcomingEvents.length > 0) return upcomingEvents;
-    return events;
-  }, [events, ownerHistoryEvents, upcomingEvents]);
+    let base: RadarCardItem[] = [];
+    if (upcomingMine.length > 0) {
+      base = upcomingMine;
+    } else if (ownerHistoryEvents.length > 0) {
+      base = ownerHistoryEvents;
+    } else if (upcomingEvents.length > 0) {
+      base = upcomingEvents;
+    } else {
+      base = events;
+    }
+
+    if (!focusedRadar) return base;
+    if (base.some((item) => item.id === focusedRadar.id)) return base;
+    return [focusedRadar, ...base];
+  }, [events, focusedRadar, ownerHistoryEvents, upcomingEvents]);
 
   const selectedInviteRadar = useMemo(() => {
     return (
@@ -2108,6 +2481,17 @@ export default function RadarPage() {
     enabled: Boolean(user?.id),
     refetchInterval: 60_000,
   });
+  const { data: checkInPresence = [], isLoading: isLoadingCheckInPresence } = useQuery({
+    queryKey: ['checkin-presence', defaultCheckInChurchId, user?.id],
+    queryFn: () =>
+      getCheckInPresence({
+        churchId: defaultCheckInChurchId,
+        currentUserId: user?.id,
+        limit: 8,
+      }),
+    enabled: Boolean(defaultCheckInChurchId),
+    refetchInterval: 60_000,
+  });
 
   useEffect(() => {
     const fallbackName = targetFromProfile?.full_name?.trim() || targetFromProfile?.username?.trim();
@@ -2134,6 +2518,18 @@ export default function RadarPage() {
     [incomingPersonalInvites]
   );
   const canCheckInNow = Boolean(defaultCheckInChurchId);
+  const checkInChurchName = useMemo(
+    () => churches.find((church) => church.id === checkInChurchId)?.name || 'Gereja',
+    [checkInChurchId, churches]
+  );
+  const focusedRadarMembership = focusedRadar?.id ? radarMembershipMap[focusedRadar.id] : undefined;
+  const isFocusedRadarJoined = focusedRadarMembership === 'JOINED';
+  const isFocusedRadarPending = focusedRadarMembership === 'PENDING';
+  const canInviteOnFocusedRadar = useMemo(() => {
+    if (!focusedRadar || !user?.id) return false;
+    if (focusedRadar.creatorId === user.id) return true;
+    return focusedRadar.allowMemberInvite !== false;
+  }, [focusedRadar, user?.id]);
 
   const inviteCandidateTargets = useMemo(() => {
     const list: InviteTarget[] = [];
@@ -2213,30 +2609,55 @@ export default function RadarPage() {
     }
   };
 
-  const handleCheckInNow = async () => {
+  const handleOpenCheckInDialog = () => {
+    const fallbackChurchId = defaultCheckInChurchId || churches[0]?.id || '';
+    if (!fallbackChurchId) {
+      toast.error('Belum ada data gereja untuk check-in');
+      return;
+    }
+    if (!checkInChurchId) {
+      setCheckInChurchId(fallbackChurchId);
+    }
+    setCheckInDate(toLocalDateValue(new Date()));
+    setIsCheckInDialogOpen(true);
+  };
+
+  const handleSubmitCheckIn = async () => {
     if (!user?.id) {
       toast.error('Anda harus login untuk check-in');
       return;
     }
 
-    if (!defaultCheckInChurchId) {
-      toast.error('Belum ada data gereja untuk check-in');
+    if (!checkInChurchId) {
+      toast.error('Pilih gereja terlebih dahulu');
       return;
     }
 
     setIsCheckingIn(true);
     try {
+      const hierarchy = await getChurchHierarchyIds(checkInChurchId);
+      const resolvedCountryId = profile?.country_id || hierarchy.countryId;
+      const resolvedDioceseId = profile?.diocese_id || hierarchy.dioceseId;
       await setCheckInNow({
         userId: user.id,
-        churchId: defaultCheckInChurchId,
-        countryId: profile?.country_id,
-        dioceseId: profile?.diocese_id,
+        churchId: checkInChurchId,
+        countryId: resolvedCountryId,
+        dioceseId: resolvedDioceseId,
+        massScheduleId: selectedCheckInSchedule?.id,
+        checkinDate: checkInDate,
+        massTime: selectedCheckInSchedule?.mass_time,
       });
-      toast.success('Check-in berhasil');
+      toast.success(
+        selectedCheckInSchedule
+          ? `Check-in berhasil (${selectedCheckInSchedule.mass_time})`
+          : 'Check-in berhasil'
+      );
+      setIsCheckInDialogOpen(false);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['active-checkin', user.id] }),
         queryClient.invalidateQueries({ queryKey: ['last-checkin', user.id] }),
         queryClient.invalidateQueries({ queryKey: ['radar-events', user.id] }),
+        queryClient.invalidateQueries({ queryKey: ['checkin-presence', checkInChurchId, user.id] }),
       ]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Gagal check-in');
@@ -2262,6 +2683,7 @@ export default function RadarPage() {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['active-checkin', user.id] }),
         queryClient.invalidateQueries({ queryKey: ['last-checkin', user.id] }),
+        queryClient.invalidateQueries({ queryKey: ['checkin-presence', defaultCheckInChurchId, user.id] }),
       ]);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Gagal check-out');
@@ -2298,6 +2720,16 @@ export default function RadarPage() {
     } finally {
       setJoiningRadarId(null);
     }
+  };
+
+  const handleOpenFocusedRadarInvite = () => {
+    if (!focusedRadar) return;
+    setSelectedInviteRadarId(focusedRadar.id);
+    setActiveTab('ajak');
+  };
+
+  const handleClearFocusedRadar = () => {
+    router.push('/radar');
   };
 
   const handleSendInvite = async (target: InviteTarget) => {
@@ -2475,7 +2907,7 @@ export default function RadarPage() {
                   'rounded-xl',
                   activeCheckIn ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/15' : 'bg-primary hover:bg-primary-hover'
                 )}
-                onClick={activeCheckIn ? handleCheckOutNow : handleCheckInNow}
+                onClick={activeCheckIn ? handleCheckOutNow : handleOpenCheckInDialog}
                 disabled={isCheckingIn || (!activeCheckIn && !canCheckInNow)}
               >
                 {isCheckingIn ? (
@@ -2491,12 +2923,62 @@ export default function RadarPage() {
                 ) : (
                   <>
                     <CheckCircle2 className="mr-2 h-4 w-4" />
-                    Check-in Sekarang
+                    Buka Wizard Check-in
                   </>
                 )}
               </Button>
             </div>
           </div>
+          {defaultCheckInChurchId && (
+            <div className="mt-4 rounded-xl border border-border/70 bg-background/80 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                  Komunitas Sedang Misa
+                </p>
+                <span className="rounded-full border border-border px-2 py-0.5 text-[11px] font-medium">
+                  {checkInPresence.length} orang
+                </span>
+              </div>
+              {isLoadingCheckInPresence ? (
+                <p className="mt-2 text-xs text-muted-foreground">Memuat kehadiran...</p>
+              ) : checkInPresence.length === 0 ? (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Belum ada user lain yang check-in aktif di {churches.find((church) => church.id === defaultCheckInChurchId)?.name || 'gereja ini'}.
+                </p>
+              ) : (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {checkInPresence.map((presence) => (
+                    <div
+                      key={presence.userId}
+                      className="flex items-center gap-2 rounded-full border border-border/70 bg-card px-2.5 py-1"
+                    >
+                      <Avatar className="h-6 w-6">
+                        <AvatarImage src={presence.avatarUrl} alt={presence.fullName || presence.username || 'User'} />
+                        <AvatarFallback>
+                          {(presence.fullName || presence.username || 'U')
+                            .split(' ')
+                            .map((part) => part[0] || '')
+                            .join('')
+                            .slice(0, 2)
+                            .toUpperCase()}
+                        </AvatarFallback>
+                      </Avatar>
+                      <div className="leading-none">
+                        <p className="text-[11px] font-medium">
+                          {presence.fullName || `@${presence.username || 'user'}`}
+                        </p>
+                        {presence.checkAt && (
+                          <p className="text-[10px] text-muted-foreground">
+                            {formatDateTimeLabel(presence.checkAt)}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -2523,6 +3005,100 @@ export default function RadarPage() {
           onClick={() => setActiveTab('ajak')}
         />
       </div>
+
+      {radarIdFromQuery && (
+        <Card className="border-primary/25 bg-primary/5 p-4 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-semibold uppercase tracking-[0.12em] text-primary">Detail Radar</p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="rounded-lg"
+              onClick={handleClearFocusedRadar}
+            >
+              Kembali ke Radar
+            </Button>
+          </div>
+
+          {isLoadingFocusedRadar ? (
+            <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Memuat detail radar...
+            </div>
+          ) : !focusedRadar ? (
+            <p className="mt-3 text-sm text-muted-foreground">
+              Radar tidak ditemukan atau sudah tidak tersedia.
+            </p>
+          ) : (
+            <div className="mt-3 rounded-xl border border-border/70 bg-card p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold">{focusedRadar.title}</h3>
+                  {focusedRadar.description && (
+                    <p className="mt-1 text-sm text-muted-foreground">{focusedRadar.description}</p>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    onClick={() => handleJoinRadar(focusedRadar)}
+                    disabled={isFocusedRadarJoined || isFocusedRadarPending || joiningRadarId === focusedRadar.id}
+                    className="rounded-lg"
+                  >
+                    {joiningRadarId === focusedRadar.id ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Bergabung...
+                      </>
+                    ) : isFocusedRadarJoined ? (
+                      'Sudah Bergabung'
+                    ) : isFocusedRadarPending ? (
+                      'Menunggu Host'
+                    ) : (
+                      'Gabung'
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleOpenFocusedRadarInvite}
+                    disabled={!canInviteOnFocusedRadar}
+                    className="rounded-lg"
+                  >
+                    Buka Ajak Misa
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+                {focusedRadar.startsAt && (
+                  <span className="flex items-center gap-1">
+                    <Calendar className="h-4 w-4" />
+                    {formatDateTimeLabel(focusedRadar.startsAt)}
+                  </span>
+                )}
+                <span className="flex items-center gap-1">
+                  <Users className="h-4 w-4" />
+                  {focusedRadar.participantCount}
+                  {focusedRadar.maxParticipants ? ` / ${focusedRadar.maxParticipants}` : ''} peserta
+                </span>
+                {focusedRadar.churchName && (
+                  <span className="flex items-center gap-1">
+                    <MapPin className="h-4 w-4" />
+                    {focusedRadar.churchName}
+                  </span>
+                )}
+              </div>
+              {!canInviteOnFocusedRadar && (
+                <p className="mt-3 text-xs font-medium text-amber-700">
+                  Host menonaktifkan undangan member untuk radar ini.
+                </p>
+              )}
+            </div>
+          )}
+        </Card>
+      )}
 
       <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as 'cari' | 'riwayat' | 'ajak')} className="w-full">
         <TabsList className="grid h-auto w-full grid-cols-3 rounded-xl border border-border/70 bg-card p-1 shadow-sm">
@@ -2554,14 +3130,57 @@ export default function RadarPage() {
         </TabsList>
 
         <TabsContent value="cari" className="mt-4">
-          <RadarList
-            radars={upcomingEvents}
-            isLoading={isLoading}
-            joinedRadarSet={joinedRadarSet}
-            pendingRadarSet={pendingRadarSet}
-            joiningRadarId={joiningRadarId}
-            onJoin={handleJoinRadar}
-          />
+          <div className="space-y-3">
+            <Card className="border-border/70 bg-card p-4 shadow-sm">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { key: 'today' as const, label: 'Hari Ini' },
+                    { key: 'tomorrow' as const, label: 'Besok' },
+                    { key: 'week' as const, label: '7 Hari' },
+                    { key: 'all' as const, label: 'Semua' },
+                  ].map((option) => (
+                    <Button
+                      key={option.key}
+                      type="button"
+                      size="sm"
+                      variant={publicFilter === option.key ? 'default' : 'outline'}
+                      className={cn(publicFilter === option.key && 'bg-primary hover:bg-primary-hover')}
+                      onClick={() => setPublicFilter(option.key)}
+                    >
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    Urutkan
+                  </label>
+                  <select
+                    value={publicSort}
+                    onChange={(event) => setPublicSort(event.target.value as PublicSort)}
+                    className="h-9 rounded-md border border-input bg-background px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                  >
+                    <option value="soonest">Terdekat</option>
+                    <option value="popular">Terpopuler</option>
+                  </select>
+                </div>
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Menampilkan {filteredUpcomingEvents.length} radar.
+              </p>
+            </Card>
+
+            <RadarList
+              radars={filteredUpcomingEvents}
+              isLoading={isLoading}
+              joinedRadarSet={joinedRadarSet}
+              pendingRadarSet={pendingRadarSet}
+              joiningRadarId={joiningRadarId}
+              onJoin={handleJoinRadar}
+            />
+          </div>
         </TabsContent>
         <TabsContent value="riwayat" className="mt-4">
           <RadarList
@@ -2956,6 +3575,107 @@ export default function RadarPage() {
           </div>
         </TabsContent>
       </Tabs>
+
+      <Dialog open={isCheckInDialogOpen} onOpenChange={setIsCheckInDialogOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Check-in Misa</DialogTitle>
+            <DialogDescription>
+              Pilih gereja dan jadwal misa (opsional) agar check-in lebih akurat.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="checkin-church">
+                Gereja
+              </label>
+              <select
+                id="checkin-church"
+                value={checkInChurchId}
+                onChange={(event) => setCheckInChurchId(event.target.value)}
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+              >
+                <option value="">Pilih gereja</option>
+                {churches.map((church) => (
+                  <option key={church.id} value={church.id}>
+                    {church.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="checkin-date">
+                Tanggal Misa
+              </label>
+              <Input
+                id="checkin-date"
+                type="date"
+                value={checkInDate}
+                onChange={(event) => setCheckInDate(event.target.value)}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium" htmlFor="checkin-schedule">
+                Jadwal Misa (Opsional)
+              </label>
+              <select
+                id="checkin-schedule"
+                value={checkInScheduleId}
+                onChange={(event) => setCheckInScheduleId(event.target.value)}
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                disabled={!checkInChurchId || isLoadingCheckInSchedules}
+              >
+                <option value="">
+                  {isLoadingCheckInSchedules
+                    ? 'Memuat jadwal...'
+                    : scheduleOptionsForDate.length === 0
+                      ? 'Tidak ada jadwal untuk tanggal ini'
+                      : 'Pilih jadwal misa'}
+                </option>
+                {scheduleOptionsForDate.map((schedule) => (
+                  <option key={schedule.id} value={schedule.id}>
+                    {schedule.mass_time} • {schedule.notes || 'Misa'}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
+              Check-in akan dicatat untuk <span className="font-medium text-foreground">{checkInChurchName}</span>.
+              {selectedCheckInSchedule ? ` Jadwal: ${selectedCheckInSchedule.mass_time}.` : ' Anda bisa lanjut tanpa memilih jadwal.'}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-1">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setIsCheckInDialogOpen(false)}
+                disabled={isCheckingIn}
+              >
+                Batal
+              </Button>
+              <Button
+                type="button"
+                onClick={handleSubmitCheckIn}
+                disabled={isCheckingIn || !checkInChurchId}
+                className="bg-primary hover:bg-primary-hover"
+              >
+                {isCheckingIn ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Menyimpan...
+                  </>
+                ) : (
+                  'Simpan Check-in'
+                )}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
         <DialogContent className="max-w-lg">
