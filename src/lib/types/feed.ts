@@ -24,6 +24,7 @@ export interface Post {
   };
   is_liked?: boolean;
   is_saved?: boolean;
+  is_reposted?: boolean;
 }
 
 export interface Like {
@@ -42,6 +43,7 @@ export interface Comment {
   id: string;
   user_id: string;
   post_id: string;
+  parent_id?: string;
   content: string;
   created_at: string;
   profile?: {
@@ -58,4 +60,11 @@ export interface Save {
   post_id: string;
   created_at: string;
   post?: Post;
+}
+
+export interface BlockedUser {
+  id: string;
+  full_name?: string;
+  avatar_url?: string;
+  blocked_at: string;
 }

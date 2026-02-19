@@ -4,7 +4,6 @@
 
 import { useRef, useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
-import { cn } from '@/lib/utils';
 
 interface InfiniteScrollProps {
   children: React.ReactNode;
@@ -21,10 +20,11 @@ export function InfiniteScroll({
   loadMore,
   isLoading = false,
   threshold = 200,
-  rootMargin = '0px 0px 200px 0px',
+  rootMargin,
 }: InfiniteScrollProps) {
   const triggerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<IntersectionObserver | null>(null);
+  const effectiveRootMargin = rootMargin ?? `0px 0px ${Math.max(0, threshold)}px 0px`;
 
   useEffect(() => {
     if (!hasMore || isLoading) {
@@ -39,7 +39,7 @@ export function InfiniteScroll({
         }
       },
       {
-        rootMargin,
+        rootMargin: effectiveRootMargin,
         threshold: 0,
       }
     );
@@ -56,7 +56,7 @@ export function InfiniteScroll({
         observer.disconnect();
       }
     };
-  }, [hasMore, isLoading, threshold, rootMargin, loadMore]);
+  }, [hasMore, isLoading, effectiveRootMargin, loadMore]);
 
   return (
     <div className="space-y-4">

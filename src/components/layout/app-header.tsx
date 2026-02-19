@@ -22,7 +22,7 @@ import {
 const centerNavItems = [
   { href: '/home', icon: Home, label: 'Beranda' },
   { href: '/radar', icon: Compass, label: 'Radar' },
-  { href: '/chat', icon: MessageCircle, label: 'Pesan' },
+  { href: '/chat', icon: MessageCircle, label: 'Chat' },
 ];
 
 export function AppHeader() {

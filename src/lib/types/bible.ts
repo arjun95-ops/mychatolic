@@ -8,6 +8,7 @@ export interface BibleBook {
   total_chapters: number;
   book_order: number;
   language_code: string;
+  version_code: string;
 }
 
 export interface BibleChapter {
@@ -23,4 +24,11 @@ export interface BibleVerse {
   text: string;
   type?: string;
   pericope?: string;
+}
+
+export interface BibleVerseSearchHit {
+  book_id: string;
+  chapter: number;
+  verse_number: number;
+  text: string;
 }

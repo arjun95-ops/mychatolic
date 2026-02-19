@@ -56,18 +56,38 @@ type RadarParticipantItem = {
   avatarUrl?: string;
 };
 
-function isMissingColumnError(message: string) {
-  const lower = message.toLowerCase();
+function readErrorMessage(error: unknown) {
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  if (typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  try {
+    const raw = JSON.stringify(error);
+    return raw === '{}' ? '' : raw;
+  } catch {
+    return '';
+  }
+}
+
+function isMissingColumnError(message: unknown) {
+  const lower = readErrorMessage(message).toLowerCase();
   return lower.includes('42703') || lower.includes('does not exist');
 }
 
-function isMissingRelationError(message: string) {
-  const lower = message.toLowerCase();
-  return lower.includes('42p01') || lower.includes('relation') && lower.includes('does not exist');
+function isMissingRelationError(message: unknown) {
+  const lower = readErrorMessage(message).toLowerCase();
+  return (
+    lower.includes('42p01') ||
+    (lower.includes('relation') && lower.includes('does not exist')) ||
+    (lower.includes('table') && lower.includes('does not exist')) ||
+    lower.includes('could not find the table') ||
+    (lower.includes('schema cache') && (lower.includes('table') || lower.includes('relation')))
+  );
 }
 
-function isPermissionError(message: string) {
-  const lower = message.toLowerCase();
+function isPermissionError(message: unknown) {
+  const lower = readErrorMessage(message).toLowerCase();
   return (
     lower.includes('42501') ||
     lower.includes('permission denied') ||
@@ -75,19 +95,21 @@ function isPermissionError(message: string) {
   );
 }
 
-function isFunctionMissingError(message: string) {
-  const lower = message.toLowerCase();
+function isFunctionMissingError(message: unknown) {
+  const lower = readErrorMessage(message).toLowerCase();
   return lower.includes('could not find the function') || lower.includes('does not exist');
 }
 
-function isNotAuthenticatedError(message: string) {
-  return message.toLowerCase().includes('not authenticated');
+function isNotAuthenticatedError(message: unknown) {
+  return readErrorMessage(message).toLowerCase().includes('not authenticated');
 }
 
-function extractMissingColumnName(message: string): string | null {
-  const withQuote = message.match(/column\s+"([^"]+)"/i);
+function extractMissingColumnName(message: unknown): string | null {
+  const raw = readErrorMessage(message);
+  if (!raw) return null;
+  const withQuote = raw.match(/column\s+"([^"]+)"/i);
   if (withQuote?.[1]) return withQuote[1];
-  const withSingleQuote = message.match(/column\s+'([^']+)'/i);
+  const withSingleQuote = raw.match(/column\s+'([^']+)'/i);
   if (withSingleQuote?.[1]) return withSingleQuote[1];
   return null;
 }
@@ -268,7 +290,7 @@ async function fetchRadarParticipants(radarId: string): Promise<RadarParticipant
     let resultError = withProfile.error;
     let includeProfile = true;
 
-    if (resultError && isMissingColumnError(resultError.message)) {
+    if (resultError && isMissingColumnError(resultError)) {
       const fallback = await supabase
         .from(table)
         .select('id, radar_id, user_id, status, role, created_at')
@@ -280,8 +302,8 @@ async function fetchRadarParticipants(radarId: string): Promise<RadarParticipant
     }
 
     if (resultError) {
-      if (!isPermissionError(resultError.message)) {
-        console.error(`Error fetching participants from ${table}:`, resultError);
+      if (!isPermissionError(resultError) && !isMissingRelationError(resultError)) {
+        console.error(`Error fetching participants from ${table}:`, readErrorMessage(resultError) || resultError);
       }
       continue;
     }
@@ -461,7 +483,7 @@ async function fetchMyMembershipStatus(userId?: string, radarId?: string): Promi
 
     let data = withRole.data as Record<string, unknown> | null;
     let resultError = withRole.error;
-    if (resultError && isMissingColumnError(resultError.message)) {
+    if (resultError && isMissingColumnError(resultError)) {
       const fallback = await supabase
         .from(table)
         .select('status')
@@ -473,8 +495,8 @@ async function fetchMyMembershipStatus(userId?: string, radarId?: string): Promi
     }
 
     if (resultError) {
-      if (!isPermissionError(resultError.message) && !isMissingColumnError(resultError.message)) {
-        console.error(`Error fetching my status from ${table}:`, resultError);
+      if (!isPermissionError(resultError) && !isMissingColumnError(resultError) && !isMissingRelationError(resultError)) {
+        console.error(`Error fetching my status from ${table}:`, readErrorMessage(resultError) || resultError);
       }
       continue;
     }

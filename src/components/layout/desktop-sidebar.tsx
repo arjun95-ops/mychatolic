@@ -25,7 +25,7 @@ import { cn } from '@/lib/utils';
 
 const navItems = [
   { href: '/home', icon: Home, label: 'Feed' },
-  { href: '/chat', icon: MessageCircle, label: 'Pesan' },
+  { href: '/chat', icon: MessageCircle, label: 'Chat' },
   { href: '/radar', icon: Compass, label: 'Radar Misa' },
   { href: '/schedule', icon: Calendar, label: 'Jadwal' },
   { href: '/bible', icon: BookOpen, label: 'Alkitab' },
@@ -50,7 +50,7 @@ export function DesktopSidebar() {
     const compactLinks = [
       { href: '/home', icon: Home, label: 'Beranda' },
       { href: '/radar', icon: Compass, label: 'Explore' },
-      { href: '/chat', icon: MessageCircle, label: 'Pesan' },
+      { href: '/chat', icon: MessageCircle, label: 'Chat' },
       { href: '/schedule', icon: Calendar, label: 'Jadwal' },
       { href: '/bible', icon: BookOpen, label: 'Alkitab' },
     ];

@@ -27,8 +27,9 @@ import {
 import { toast } from 'sonner';
 import { AuthService } from '@/lib/features/auth/auth-service';
 import { useAuth } from '@/lib/features/auth/use-auth';
-import { useSavedPosts } from '@/lib/features/feed/use-posts';
+import { useBlockedUsers, useSavedPosts, useUnblockUser } from '@/lib/features/feed/use-posts';
 import { PostCard } from '@/components/feed/post-card';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -1028,6 +1029,19 @@ function LanguageSettings() {
 }
 
 function BlockedUsersSettings() {
+  const { data: blockedUsers = [], isLoading } = useBlockedUsers();
+  const { mutateAsync: unblockUser, isPending: isUnblocking } = useUnblockUser();
+  const [activeUserId, setActiveUserId] = useState<string | null>(null);
+
+  const handleUnblock = async (userId: string) => {
+    setActiveUserId(userId);
+    try {
+      await unblockUser(userId);
+    } finally {
+      setActiveUserId(null);
+    }
+  };
+
   return (
     <SettingsDetailCard
       icon={<ShieldCheck className="h-5 w-5" />}
@@ -1036,8 +1050,62 @@ function BlockedUsersSettings() {
       tone="slate"
       contentClassName="space-y-2 text-sm text-muted-foreground"
     >
-        <p>Daftar blokir belum tersedia di web versi ini.</p>
-        <p>Gunakan aplikasi mobile untuk melihat dan mengelola pengguna yang diblokir.</p>
+        {isLoading ? (
+          <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-muted/30 p-4">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <p>Memuat daftar blokir...</p>
+          </div>
+        ) : blockedUsers.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 p-4 text-center">
+            <p className="text-sm font-medium text-foreground">Belum ada pengguna diblokir</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              User yang Anda blokir akan muncul di sini dan bisa dibuka blokirnya kapan saja.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {blockedUsers.map((blockedUser) => {
+              const fullName = blockedUser.full_name?.trim() || 'Umat';
+              const initials = fullName
+                .split(' ')
+                .map((part) => part[0])
+                .join('')
+                .toUpperCase()
+                .slice(0, 2);
+              const isActive = activeUserId === blockedUser.id;
+
+              return (
+                <div
+                  key={blockedUser.id}
+                  className="flex flex-col gap-3 rounded-xl border border-border/70 bg-background/70 p-3 sm:flex-row sm:items-center"
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <Avatar className="h-10 w-10 border border-border/70">
+                      <AvatarImage src={blockedUser.avatar_url} alt={fullName} />
+                      <AvatarFallback>{initials || 'US'}</AvatarFallback>
+                    </Avatar>
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-foreground">{fullName}</p>
+                      <p className="text-xs text-muted-foreground">
+                        Diblokir pada {new Date(blockedUser.blocked_at).toLocaleString('id-ID')}
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={isUnblocking}
+                    onClick={() => void handleUnblock(blockedUser.id)}
+                    className="w-full rounded-lg sm:w-auto"
+                  >
+                    {isActive && isUnblocking ? 'Membuka blokir...' : 'Buka blokir'}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        )}
     </SettingsDetailCard>
   );
 }

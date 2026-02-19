@@ -573,15 +573,17 @@ export class AuthService {
       .filter((item) => item.id && item.name);
   }
 
-  static async getDioceses(countryId: string, search = ''): Promise<AuthLocationOption[]> {
-    if (!countryId) return [];
-
+  static async getDioceses(countryId = '', search = ''): Promise<AuthLocationOption[]> {
     let query = supabase
       .from('dioceses')
       .select('id, name')
-      .eq('country_id', countryId)
       .order('name', { ascending: true })
       .limit(LOCATION_FETCH_LIMIT);
+
+    const normalizedCountryId = countryId.trim();
+    if (normalizedCountryId) {
+      query = query.eq('country_id', normalizedCountryId);
+    }
 
     const keyword = search.trim();
     if (keyword) {
@@ -602,15 +604,17 @@ export class AuthService {
       .filter((item) => item.id && item.name);
   }
 
-  static async getParishes(dioceseId: string, search = ''): Promise<AuthLocationOption[]> {
-    if (!dioceseId) return [];
-
+  static async getParishes(dioceseId = '', search = ''): Promise<AuthLocationOption[]> {
     let query = supabase
       .from('churches')
       .select('id, name')
-      .eq('diocese_id', dioceseId)
       .order('name', { ascending: true })
       .limit(LOCATION_FETCH_LIMIT);
+
+    const normalizedDioceseId = dioceseId.trim();
+    if (normalizedDioceseId) {
+      query = query.eq('diocese_id', normalizedDioceseId);
+    }
 
     const keyword = search.trim();
     if (keyword) {

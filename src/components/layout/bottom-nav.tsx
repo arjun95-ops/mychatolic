@@ -12,7 +12,7 @@ const navItems = [
   { href: '/schedule', icon: Calendar, label: 'Jadwal' },
   { href: '/bible', icon: BookOpen, label: 'Alkitab' },
   { href: '/radar', icon: Radar, label: 'Radar' },
-  { href: '/chat', icon: MessageSquare, label: 'Pesan' },
+  { href: '/chat', icon: MessageSquare, label: 'Chat' },
   { href: '/profile', icon: User, label: 'Profil' },
 ];
 

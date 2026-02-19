@@ -1,7 +1,7 @@
 // Feed Service
 
 import { supabase } from '@/lib/supabase/client';
-import type { Comment, Like, Post } from '@/lib/types';
+import type { BlockedUser, Comment, Like, Post } from '@/lib/types';
 import { createRandomToken, createRandomUUID } from '@/lib/utils';
 
 function isMissingColumnError(message: string, column: string) {
@@ -10,6 +10,105 @@ function isMissingColumnError(message: string, column: string) {
     normalized.includes(column.toLowerCase()) &&
     (normalized.includes('does not exist') || normalized.includes('42703') || normalized.includes('schema cache'))
   );
+}
+
+function isMissingSchemaObjectError(message: string) {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('does not exist') ||
+    normalized.includes('schema cache') ||
+    normalized.includes('42703') ||
+    normalized.includes('42p01')
+  );
+}
+
+function isDuplicateError(message: string) {
+  const normalized = message.toLowerCase();
+  return normalized.includes('23505') || normalized.includes('duplicate key');
+}
+
+function isNotNullViolationError(message: string) {
+  const normalized = message.toLowerCase();
+  return normalized.includes('23502') || normalized.includes('null value in column');
+}
+
+function readErrorMessage(error: unknown): string {
+  if (!error) return 'Unknown error';
+  if (typeof error === 'string') return error;
+  if (typeof error === 'object' && 'message' in error && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+
+  try {
+    const serialized = JSON.stringify(error);
+    return serialized === '{}' ? 'Unknown error object' : serialized;
+  } catch {
+    return 'Unknown error object';
+  }
+}
+
+type BlockRelationConfig = {
+  table: string;
+  blockerColumn: string;
+  blockedColumn: string;
+};
+
+const BLOCK_RELATION_CONFIGS: BlockRelationConfig[] = [
+  { table: 'user_blocks', blockerColumn: 'blocker_id', blockedColumn: 'blocked_user_id' },
+  { table: 'user_blocks', blockerColumn: 'blocker_id', blockedColumn: 'blocked_id' },
+  { table: 'user_blocks', blockerColumn: 'user_id', blockedColumn: 'blocked_user_id' },
+  { table: 'user_blocks', blockerColumn: 'user_id', blockedColumn: 'blocked_id' },
+  { table: 'blocked_users', blockerColumn: 'user_id', blockedColumn: 'blocked_user_id' },
+];
+
+function getBlockInsertPayloads(
+  config: BlockRelationConfig,
+  blockerId: string,
+  blockedUserId: string
+): Array<Record<string, unknown>> {
+  const columnValueMap: Record<string, string> = {
+    blocker_id: blockerId,
+    user_id: blockerId,
+    blocked_user_id: blockedUserId,
+    blocked_id: blockedUserId,
+  };
+  const createdAt = new Date().toISOString();
+  const baseColumns = [config.blockerColumn, config.blockedColumn];
+  const buildPayload = (columns: string[]) => {
+    const payload: Record<string, unknown> = { created_at: createdAt };
+    for (const column of columns) {
+      payload[column] = columnValueMap[column];
+    }
+    return payload;
+  };
+
+  if (config.table !== 'user_blocks') {
+    return [buildPayload(baseColumns)];
+  }
+
+  const optionalColumns = ['blocker_id', 'user_id', 'blocked_user_id', 'blocked_id'].filter(
+    (column) => !baseColumns.includes(column)
+  );
+
+  const subsets: string[][] = [[]];
+  for (const column of optionalColumns) {
+    const next = subsets.map((subset) => [...subset, column]);
+    subsets.push(...next);
+  }
+
+  const payloads = subsets
+    .sort((a, b) => a.length - b.length)
+    .map((subset) => buildPayload([...baseColumns, ...subset]));
+  const deduped: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const payload of payloads) {
+    const key = JSON.stringify(payload);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(payload);
+  }
+
+  return deduped;
 }
 
 function parseImageUrls(value: unknown): string[] {
@@ -58,7 +157,10 @@ function getProfileRow(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function mapPostRow(row: Record<string, unknown>, flags?: { isLiked?: boolean; isSaved?: boolean }): Post {
+function mapPostRow(
+  row: Record<string, unknown>,
+  flags?: { isLiked?: boolean; isSaved?: boolean; isReposted?: boolean }
+): Post {
   const profile = getProfileRow(row.profiles);
   const fullName =
     profile?.full_name?.toString().trim() ||
@@ -91,6 +193,7 @@ function mapPostRow(row: Record<string, unknown>, flags?: { isLiked?: boolean; i
       : undefined,
     is_liked: flags?.isLiked ?? false,
     is_saved: flags?.isSaved ?? false,
+    is_reposted: flags?.isReposted ?? false,
   };
 }
 
@@ -129,23 +232,26 @@ export class FeedService {
 
     if (error) {
       console.error('Error fetching posts:', error);
-      return { posts: [], hasMore: false };
+      throw new Error(readErrorMessage(error) || 'Gagal memuat feed');
     }
 
     const rows = (data ?? []) as Record<string, unknown>[];
-    const needsSaveCountFallback = rows.some((row) => row.saves_count == null);
-    const needsShareCountFallback = rows.some((row) => row.shares_count == null);
+    const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+    const visibleRows = rows.filter((row) => !hiddenUserIds.has(row.user_id?.toString() ?? ''));
+    const needsSaveCountFallback = visibleRows.some((row) => row.saves_count == null);
+    const needsShareCountFallback = visibleRows.some((row) => row.shares_count == null);
 
-    const postIds = rows.map((row) => row.id?.toString()).filter((id): id is string => Boolean(id));
-    const [likedSet, savedSet, saveCounts, shareCounts] = await Promise.all([
+    const postIds = visibleRows.map((row) => row.id?.toString()).filter((id): id is string => Boolean(id));
+    const [likedSet, savedSet, repostedSet, saveCounts, shareCounts] = await Promise.all([
       this.getUserPostFlags('likes', currentUserId, postIds),
       this.getUserPostFlags('saved_posts', currentUserId, postIds),
+      this.getUserPostFlags('post_shares', currentUserId, postIds),
       needsSaveCountFallback ? this.getAggregateCounts('saved_posts', postIds) : Promise.resolve(new Map()),
       needsShareCountFallback ? this.getAggregateCounts('post_shares', postIds) : Promise.resolve(new Map()),
     ]);
 
     return {
-      posts: rows.map((row) => {
+      posts: visibleRows.map((row) => {
         const postId = row.id?.toString() ?? '';
         return mapPostRow(
           {
@@ -156,6 +262,7 @@ export class FeedService {
           {
             isLiked: likedSet.has(postId),
             isSaved: savedSet.has(postId),
+            isReposted: repostedSet.has(postId),
           }
         );
       }),
@@ -187,9 +294,18 @@ export class FeedService {
       return null;
     }
 
-    const [likedSet, savedSet, saveCounts, shareCounts] = await Promise.all([
+    const ownerId = (data as Record<string, unknown>).user_id?.toString() ?? '';
+    if (currentUserId && ownerId) {
+      const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+      if (hiddenUserIds.has(ownerId)) {
+        return null;
+      }
+    }
+
+    const [likedSet, savedSet, repostedSet, saveCounts, shareCounts] = await Promise.all([
       this.getUserPostFlags('likes', currentUserId, [postId]),
       this.getUserPostFlags('saved_posts', currentUserId, [postId]),
+      this.getUserPostFlags('post_shares', currentUserId, [postId]),
       data.saves_count == null ? this.getAggregateCounts('saved_posts', [postId]) : Promise.resolve(new Map()),
       data.shares_count == null ? this.getAggregateCounts('post_shares', [postId]) : Promise.resolve(new Map()),
     ]);
@@ -201,6 +317,7 @@ export class FeedService {
     }, {
       isLiked: likedSet.has(postId),
       isSaved: savedSet.has(postId),
+      isReposted: repostedSet.has(postId),
     });
   }
 
@@ -239,19 +356,22 @@ export class FeedService {
     }
 
     const rows = (data ?? []) as Record<string, unknown>[];
-    const needsSaveCountFallback = rows.some((row) => row.saves_count == null);
-    const needsShareCountFallback = rows.some((row) => row.shares_count == null);
-    const postIds = rows.map((row) => row.id?.toString()).filter((id): id is string => Boolean(id));
+    const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+    const visibleRows = rows.filter((row) => !hiddenUserIds.has(row.user_id?.toString() ?? ''));
+    const needsSaveCountFallback = visibleRows.some((row) => row.saves_count == null);
+    const needsShareCountFallback = visibleRows.some((row) => row.shares_count == null);
+    const postIds = visibleRows.map((row) => row.id?.toString()).filter((id): id is string => Boolean(id));
 
-    const [likedSet, savedSet, saveCounts, shareCounts] = await Promise.all([
+    const [likedSet, savedSet, repostedSet, saveCounts, shareCounts] = await Promise.all([
       this.getUserPostFlags('likes', currentUserId, postIds),
       this.getUserPostFlags('saved_posts', currentUserId, postIds),
+      this.getUserPostFlags('post_shares', currentUserId, postIds),
       needsSaveCountFallback ? this.getAggregateCounts('saved_posts', postIds) : Promise.resolve(new Map()),
       needsShareCountFallback ? this.getAggregateCounts('post_shares', postIds) : Promise.resolve(new Map()),
     ]);
 
     return {
-      posts: rows.map((row) => {
+      posts: visibleRows.map((row) => {
         const postId = row.id?.toString() ?? '';
         return mapPostRow(
           {
@@ -262,6 +382,7 @@ export class FeedService {
           {
             isLiked: likedSet.has(postId),
             isSaved: savedSet.has(postId),
+            isReposted: repostedSet.has(postId),
           }
         );
       }),
@@ -401,11 +522,11 @@ export class FeedService {
   }
 
   // Get post likes
-  static async getPostLikes(postId: string, page = 1, limit = 20): Promise<Like[]> {
+  static async getPostLikes(postId: string, page = 1, limit = 20, currentUserId?: string): Promise<Like[]> {
     const fromRange = (page - 1) * limit;
     const toRange = page * limit - 1;
 
-    const { data, error } = await supabase
+    const likesWithProfiles = await supabase
       .from('likes')
       .select(
         `
@@ -421,46 +542,144 @@ export class FeedService {
       .order('created_at', { ascending: false })
       .range(fromRange, toRange);
 
-    if (error) {
-      console.error('Error fetching likes:', error);
+    if (!likesWithProfiles.error) {
+      const rows = (likesWithProfiles.data ?? []) as unknown as Like[];
+      if (!currentUserId) {
+        return rows;
+      }
+
+      const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+      return rows.filter((like) => !hiddenUserIds.has(like.user_id));
+    }
+
+    // Fallback for stricter RLS or schema differences on joined profile relation.
+    const likesOnly = await supabase
+      .from('likes')
+      .select('id, user_id, post_id, created_at')
+      .eq('post_id', postId)
+      .order('created_at', { ascending: false })
+      .range(fromRange, toRange);
+
+    if (likesOnly.error) {
+      console.warn('FeedService.getPostLikes fallback failed:', {
+        primary: readErrorMessage(likesWithProfiles.error),
+        fallback: readErrorMessage(likesOnly.error),
+      });
       return [];
     }
 
-    return (data ?? []) as Like[];
+    const rawLikes = (likesOnly.data ?? []) as unknown as Array<Record<string, unknown>>;
+    const likeRows = rawLikes.map((row) => ({
+      id: row.id?.toString() ?? createRandomUUID(),
+      user_id: row.user_id?.toString() ?? '',
+      post_id: row.post_id?.toString() ?? postId,
+      created_at: row.created_at?.toString() ?? new Date().toISOString(),
+    }));
+
+    let resolvedLikeRows = likeRows;
+    if (currentUserId) {
+      const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+      resolvedLikeRows = likeRows.filter((like) => !hiddenUserIds.has(like.user_id));
+    }
+    const likerIds = resolvedLikeRows.map((row) => row.user_id).filter((id) => id.length > 0);
+    if (likerIds.length === 0) {
+      return resolvedLikeRows as unknown as Like[];
+    }
+
+    const profilesResult = await supabase
+      .from('profiles')
+      .select('id, full_name, avatar_url')
+      .in('id', likerIds);
+
+    const profileMap = new Map<string, { id: string; full_name?: string; avatar_url?: string }>();
+    if (!profilesResult.error) {
+      for (const profile of (profilesResult.data ?? []) as unknown as Array<Record<string, unknown>>) {
+        const id = profile.id?.toString();
+        if (!id) continue;
+        profileMap.set(id, {
+          id,
+          full_name: profile.full_name?.toString(),
+          avatar_url: profile.avatar_url?.toString(),
+        });
+      }
+    }
+
+    return resolvedLikeRows.map((row) => ({
+      ...row,
+      profile: profileMap.get(row.user_id),
+    })) as Like[];
   }
 
   // Add comment
-  static async addComment(userId: string, postId: string, content: string): Promise<Comment> {
-    const { data, error } = await supabase
-      .from('comments')
-      .insert({
-        user_id: userId,
-        post_id: postId,
-        content,
-      })
-      .select(
-        `
-        *,
-        profiles:user_id (
-          id,
-          full_name,
-          avatar_url,
-          role
-        )
-      `
+  static async addComment(
+    userId: string,
+    postId: string,
+    content: string,
+    options?: { parentId?: string; replyToName?: string }
+  ): Promise<Comment> {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      throw new Error('Komentar tidak boleh kosong');
+    }
+
+    const selectComment = `
+      *,
+      profiles:user_id (
+        id,
+        full_name,
+        avatar_url,
+        role
       )
+    `;
+
+    const firstInsertPayload: Record<string, unknown> = {
+      user_id: userId,
+      post_id: postId,
+      content: trimmed,
+    };
+
+    if (options?.parentId) {
+      firstInsertPayload.parent_id = options.parentId;
+    }
+
+    let insertResult = await supabase
+      .from('comments')
+      .insert(firstInsertPayload)
+      .select(selectComment)
       .single();
 
-    if (error) {
-      throw new Error(error.message);
+    // Backward compatibility: some environments may not have `parent_id` yet.
+    if (
+      insertResult.error &&
+      options?.parentId &&
+      isMissingColumnError(insertResult.error.message, 'parent_id')
+    ) {
+      const mentionPrefix =
+        options.replyToName && !trimmed.startsWith(`@${options.replyToName}`)
+          ? `@${options.replyToName} `
+          : '';
+
+      insertResult = await supabase
+        .from('comments')
+        .insert({
+          user_id: userId,
+          post_id: postId,
+          content: `${mentionPrefix}${trimmed}`.trim(),
+        })
+        .select(selectComment)
+        .single();
+    }
+
+    if (insertResult.error || !insertResult.data) {
+      throw new Error(insertResult.error?.message || 'Gagal menambahkan komentar');
     }
 
     await this.syncAggregateCount('comments', 'comments_count', postId);
-    return data as Comment;
+    return insertResult.data as Comment;
   }
 
   // Get post comments
-  static async getPostComments(postId: string, page = 1, limit = 20): Promise<Comment[]> {
+  static async getPostComments(postId: string, page = 1, limit = 20, currentUserId?: string): Promise<Comment[]> {
     const fromRange = (page - 1) * limit;
     const toRange = page * limit - 1;
 
@@ -486,7 +705,13 @@ export class FeedService {
       return [];
     }
 
-    return (data ?? []) as Comment[];
+    const rows = (data ?? []) as Record<string, unknown>[];
+    if (!currentUserId) {
+      return rows as unknown as Comment[];
+    }
+
+    const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+    return rows.filter((row) => !hiddenUserIds.has(row.user_id?.toString() ?? '')) as unknown as Comment[];
   }
 
   // Delete comment
@@ -495,6 +720,299 @@ export class FeedService {
     if (error) {
       throw new Error(error.message);
     }
+  }
+
+  static async reportComment(userId: string, commentId: string, reason: string): Promise<void> {
+    const normalizedReason = reason.trim();
+    const payloads: Array<{ table: string; row: Record<string, unknown> }> = [
+      {
+        table: 'comment_reports',
+        row: {
+          comment_id: commentId,
+          reporter_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'comment_reports',
+        row: {
+          comment_id: commentId,
+          user_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'reports',
+        row: {
+          comment_id: commentId,
+          reporter_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'reports',
+        row: {
+          comment_id: commentId,
+          user_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+    ];
+
+    let lastCompatibilityError: string | null = null;
+
+    for (const payload of payloads) {
+      const result = await supabase.from(payload.table).insert(payload.row);
+      if (!result.error) {
+        return;
+      }
+
+      if (isDuplicateError(result.error.message)) {
+        return;
+      }
+
+      if (isMissingSchemaObjectError(result.error.message)) {
+        lastCompatibilityError = result.error.message;
+        continue;
+      }
+
+      throw new Error(result.error.message);
+    }
+
+    throw new Error(lastCompatibilityError || 'Gagal mengirim laporan komentar');
+  }
+
+  static async reportPost(userId: string, postId: string, reason: string): Promise<void> {
+    const normalizedReason = reason.trim();
+    const payloads: Array<{ table: string; row: Record<string, unknown> }> = [
+      {
+        table: 'reports',
+        row: {
+          post_id: postId,
+          reporter_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'reports',
+        row: {
+          post_id: postId,
+          user_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'post_reports',
+        row: {
+          post_id: postId,
+          reporter_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+      {
+        table: 'post_reports',
+        row: {
+          post_id: postId,
+          user_id: userId,
+          reason: normalizedReason,
+          created_at: new Date().toISOString(),
+        },
+      },
+    ];
+
+    let lastCompatibilityError: string | null = null;
+
+    for (const payload of payloads) {
+      const result = await supabase.from(payload.table).insert(payload.row);
+      if (!result.error) {
+        return;
+      }
+
+      if (isDuplicateError(result.error.message)) {
+        return;
+      }
+
+      if (isMissingSchemaObjectError(result.error.message)) {
+        lastCompatibilityError = result.error.message;
+        continue;
+      }
+
+      throw new Error(result.error.message);
+    }
+
+    throw new Error(lastCompatibilityError || 'Gagal mengirim laporan postingan');
+  }
+
+  static async blockUser(blockerId: string, blockedUserId: string): Promise<void> {
+    if (!blockerId || !blockedUserId) {
+      throw new Error('User tidak valid');
+    }
+    if (blockerId === blockedUserId) {
+      throw new Error('Tidak bisa memblokir diri sendiri');
+    }
+
+    let lastCompatibilityError: string | null = null;
+
+    for (const config of BLOCK_RELATION_CONFIGS) {
+      const payloads = getBlockInsertPayloads(config, blockerId, blockedUserId);
+
+      for (const payload of payloads) {
+        const result = await supabase.from(config.table).insert(payload);
+        if (!result.error) {
+          return;
+        }
+
+        if (isDuplicateError(result.error.message)) {
+          return;
+        }
+
+        if (
+          isMissingSchemaObjectError(result.error.message) ||
+          isNotNullViolationError(result.error.message)
+        ) {
+          lastCompatibilityError = result.error.message;
+          continue;
+        }
+
+        throw new Error(result.error.message);
+      }
+    }
+
+    if (lastCompatibilityError) {
+      console.warn('FeedService.blockUser compatibility fallback exhausted:', lastCompatibilityError);
+      throw new Error('Konfigurasi blokir di database belum sinkron. Jalankan ulang SQL hotfix blokir.');
+    }
+
+    throw new Error('Fitur blokir belum tersedia di server');
+  }
+
+  static async unblockUser(blockerId: string, blockedUserId: string): Promise<void> {
+    if (!blockerId || !blockedUserId) {
+      throw new Error('User tidak valid');
+    }
+
+    let lastCompatibilityError: string | null = null;
+    let hasCompatibleSource = false;
+
+    for (const config of BLOCK_RELATION_CONFIGS) {
+      const result = await supabase
+        .from(config.table)
+        .delete()
+        .eq(config.blockerColumn, blockerId)
+        .eq(config.blockedColumn, blockedUserId);
+
+      if (!result.error) {
+        hasCompatibleSource = true;
+        continue;
+      }
+
+      if (isMissingSchemaObjectError(result.error.message)) {
+        lastCompatibilityError = result.error.message;
+        continue;
+      }
+
+      throw new Error(result.error.message);
+    }
+
+    if (hasCompatibleSource) {
+      return;
+    }
+
+    throw new Error(lastCompatibilityError || 'Fitur unblock belum tersedia di server');
+  }
+
+  static async getBlockedUsers(userId: string): Promise<BlockedUser[]> {
+    if (!userId) {
+      return [];
+    }
+
+    const rpcBlockedUsers = await supabase.rpc('get_blocked_users_for_auth');
+    if (!rpcBlockedUsers.error) {
+      return ((rpcBlockedUsers.data ?? []) as Array<Record<string, unknown>>)
+        .map((row) => ({
+          id: row.blocked_user_id?.toString() ?? '',
+          full_name:
+            row.full_name?.toString()?.trim() ||
+            row.display_name?.toString()?.trim() ||
+            row.name?.toString()?.trim() ||
+            'Umat',
+          avatar_url: row.avatar_url?.toString(),
+          blocked_at: row.blocked_at?.toString() ?? new Date().toISOString(),
+        }))
+        .filter((row) => row.id.length > 0);
+    }
+
+    const blockedAtMap = new Map<string, string>();
+    let hasCompatibleSource = false;
+
+    for (const config of BLOCK_RELATION_CONFIGS) {
+      const result = await supabase
+        .from(config.table)
+        .select(`${config.blockedColumn}, created_at`)
+        .eq(config.blockerColumn, userId)
+        .order('created_at', { ascending: false });
+
+      if (result.error) {
+        if (isMissingSchemaObjectError(result.error.message)) {
+          continue;
+        }
+        throw new Error(result.error.message);
+      }
+
+      hasCompatibleSource = true;
+      for (const row of ((result.data ?? []) as unknown as Record<string, unknown>[])) {
+        const blockedId = row[config.blockedColumn]?.toString();
+        if (!blockedId) continue;
+        const blockedAt = row.created_at?.toString() ?? new Date().toISOString();
+
+        const existing = blockedAtMap.get(blockedId);
+        if (!existing || new Date(blockedAt).getTime() > new Date(existing).getTime()) {
+          blockedAtMap.set(blockedId, blockedAt);
+        }
+      }
+    }
+
+    if (!hasCompatibleSource || blockedAtMap.size === 0) {
+      return [];
+    }
+
+    const blockedIds = Array.from(blockedAtMap.keys());
+    const profilesResult = await supabase.from('profiles').select('*').in('id', blockedIds);
+    const profileRows = profilesResult.error
+      ? []
+      : ((profilesResult.data ?? []) as unknown as Record<string, unknown>[]);
+
+    const profileMap = new Map<string, Record<string, unknown>>();
+    for (const row of profileRows) {
+      const id = row.id?.toString();
+      if (!id) continue;
+      profileMap.set(id, row);
+    }
+
+    return blockedIds
+      .map((id) => {
+        const profile = profileMap.get(id);
+        const profileName =
+          profile?.full_name?.toString()?.trim() ||
+          profile?.username?.toString()?.trim() ||
+          profile?.display_name?.toString()?.trim() ||
+          profile?.name?.toString()?.trim() ||
+          'Umat';
+        return {
+          id,
+          full_name: profileName,
+          avatar_url: profile?.avatar_url?.toString(),
+          blocked_at: blockedAtMap.get(id) ?? new Date().toISOString(),
+        } satisfies BlockedUser;
+      })
+      .sort((a, b) => new Date(b.blocked_at).getTime() - new Date(a.blocked_at).getTime());
   }
 
   // Toggle save/bookmark
@@ -657,8 +1175,48 @@ export class FeedService {
     await this.syncAggregateCount('post_shares', 'shares_count', postId);
   }
 
+  static async toggleRepost(userId: string, postId: string): Promise<{ reposted: boolean; count: number }> {
+    const existing = await supabase
+      .from('post_shares')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('post_id', postId)
+      .limit(1);
+
+    if (existing.error) {
+      throw new Error(existing.error.message);
+    }
+
+    const hasReposted = Boolean(existing.data && existing.data.length > 0);
+
+    if (hasReposted) {
+      const removeResult = await supabase
+        .from('post_shares')
+        .delete()
+        .eq('user_id', userId)
+        .eq('post_id', postId);
+
+      if (removeResult.error) {
+        throw new Error(removeResult.error.message);
+      }
+    } else {
+      const createResult = await supabase.from('post_shares').insert({
+        user_id: userId,
+        post_id: postId,
+        created_at: new Date().toISOString(),
+      });
+
+      if (createResult.error) {
+        throw new Error(createResult.error.message);
+      }
+    }
+
+    const count = await this.syncAggregateCount('post_shares', 'shares_count', postId);
+    return { reposted: !hasReposted, count };
+  }
+
   private static async getUserPostFlags(
-    table: 'likes' | 'saved_posts',
+    table: 'likes' | 'saved_posts' | 'post_shares',
     userId: string | undefined,
     postIds: string[]
   ): Promise<Set<string>> {
@@ -681,6 +1239,70 @@ export class FeedService {
         .map((row) => row.post_id?.toString())
         .filter((id): id is string => Boolean(id))
     );
+  }
+
+  private static async getBlockedUserSets(userId?: string): Promise<{
+    blockedByMe: Set<string>;
+    blockedMe: Set<string>;
+    hiddenUserIds: Set<string>;
+  }> {
+    const empty = {
+      blockedByMe: new Set<string>(),
+      blockedMe: new Set<string>(),
+      hiddenUserIds: new Set<string>(),
+    };
+
+    if (!userId) {
+      return empty;
+    }
+
+    const blockedByMe = new Set<string>();
+    const blockedMe = new Set<string>();
+    let hasCompatibleSource = false;
+
+    for (const config of BLOCK_RELATION_CONFIGS) {
+      const [blockedByMeResult, blockedMeResult] = await Promise.all([
+        supabase.from(config.table).select(config.blockedColumn).eq(config.blockerColumn, userId),
+        supabase.from(config.table).select(config.blockerColumn).eq(config.blockedColumn, userId),
+      ]);
+
+      const blockerSideError = blockedByMeResult.error;
+      const blockedSideError = blockedMeResult.error;
+
+      const isCompatibilityError =
+        (blockerSideError && isMissingSchemaObjectError(blockerSideError.message)) ||
+        (blockedSideError && isMissingSchemaObjectError(blockedSideError.message));
+      if (isCompatibilityError) {
+        continue;
+      }
+
+      if (blockerSideError || blockedSideError) {
+        console.error('Error fetching block relations:', blockerSideError || blockedSideError);
+        continue;
+      }
+
+      hasCompatibleSource = true;
+
+      for (const row of ((blockedByMeResult.data ?? []) as unknown as Record<string, unknown>[])) {
+        const id = row[config.blockedColumn]?.toString();
+        if (id) blockedByMe.add(id);
+      }
+
+      for (const row of ((blockedMeResult.data ?? []) as unknown as Record<string, unknown>[])) {
+        const id = row[config.blockerColumn]?.toString();
+        if (id) blockedMe.add(id);
+      }
+    }
+
+    if (!hasCompatibleSource) {
+      return empty;
+    }
+
+    return {
+      blockedByMe,
+      blockedMe,
+      hiddenUserIds: new Set<string>([...blockedByMe, ...blockedMe]),
+    };
   }
 
   private static async getAggregateCounts(
@@ -739,16 +1361,26 @@ export class FeedService {
     }
 
     const orderedIds = new Set(postIds);
-    const [likesSet, savedSetFromDb, saveCounts, shareCounts] = await Promise.all([
-      this.getUserPostFlags('likes', currentUserId, postIds),
-      this.getUserPostFlags('saved_posts', currentUserId, postIds),
-      this.getAggregateCounts('saved_posts', postIds),
-      this.getAggregateCounts('post_shares', postIds),
+    const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+    const visibleRows = ((postsData ?? []) as Record<string, unknown>[]).filter(
+      (row) =>
+        orderedIds.has(row.id?.toString() ?? '') &&
+        !hiddenUserIds.has(row.user_id?.toString() ?? '')
+    );
+    const visiblePostIds = visibleRows
+      .map((row) => row.id?.toString())
+      .filter((id): id is string => Boolean(id));
+
+    const [likesSet, savedSetFromDb, repostedSet, saveCounts, shareCounts] = await Promise.all([
+      this.getUserPostFlags('likes', currentUserId, visiblePostIds),
+      this.getUserPostFlags('saved_posts', currentUserId, visiblePostIds),
+      this.getUserPostFlags('post_shares', currentUserId, visiblePostIds),
+      this.getAggregateCounts('saved_posts', visiblePostIds),
+      this.getAggregateCounts('post_shares', visiblePostIds),
     ]);
     const savedSet = savedSetOverride ?? savedSetFromDb;
 
-    return ((postsData ?? []) as Record<string, unknown>[])
-      .filter((row) => orderedIds.has(row.id?.toString() ?? ''))
+    return visibleRows
       .sort((a, b) => postIds.indexOf(a.id?.toString() ?? '') - postIds.indexOf(b.id?.toString() ?? ''))
       .map((row) => {
         const postId = row.id?.toString() ?? '';
@@ -761,6 +1393,7 @@ export class FeedService {
           {
             isLiked: likesSet.has(postId),
             isSaved: savedSet.has(postId),
+            isReposted: repostedSet.has(postId),
           }
         );
       });

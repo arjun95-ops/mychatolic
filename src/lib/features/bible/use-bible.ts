@@ -25,3 +25,32 @@ export function useBibleVerses(bookId?: string, chapter?: number) {
     enabled: Boolean(bookId) && Boolean(chapter && chapter > 0),
   });
 }
+
+export function useBibleVerseSearch(params: {
+  query: string;
+  languageCode?: string;
+  versionCode?: string;
+  limit?: number;
+  enabled?: boolean;
+}) {
+  const normalizedQuery = params.query.trim();
+  const isEnabled = (params.enabled ?? true) && normalizedQuery.length >= 3;
+
+  return useQuery({
+    queryKey: [
+      'bible-verse-search',
+      normalizedQuery,
+      params.languageCode,
+      params.versionCode,
+      params.limit,
+    ],
+    queryFn: () =>
+      BibleService.searchVerses({
+        query: normalizedQuery,
+        languageCode: params.languageCode,
+        versionCode: params.versionCode,
+        limit: params.limit,
+      }),
+    enabled: isEnabled,
+  });
+}
