@@ -2,6 +2,9 @@
 
 Gunakan runbook ini untuk audit penuh sinkronisasi Supabase.
 
+Untuk urutan apply SQL hotfix Radar + Comments terbaru (rilis February 20, 2026), lihat:
+`docs/RADAR_COMMENTS_HOTFIX_APPLY_RUNBOOK.md`
+
 ## 1) Siapkan environment
 
 Isi `.env.local`:
@@ -45,6 +48,10 @@ Cek hasil:
 - tabel target sudah `rls_enabled=true` untuk tabel sensitif.
 - policy `select/insert/update/delete` sesuai role (`anon` vs `authenticated`).
 - RPC penting tersedia: `update_chat_metadata`, `get_chat_inbox`, `join_chat`.
+
+Tambahan audit Radar + Comments:
+- jalankan `db/radar_phase3_audit.sql`
+- jalankan `db/comments_phase3_audit.sql`
 
 ## 5) Regression check build web
 
