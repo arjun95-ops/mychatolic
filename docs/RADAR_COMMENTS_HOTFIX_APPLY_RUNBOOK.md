@@ -49,6 +49,12 @@ npm run audit:smoke:radar:invite
 npm run build
 ```
 
+Atau jalankan satu perintah gabungan:
+
+```bash
+npm run audit:release:radar
+```
+
 Expected:
 - All commands exit successfully.
 - RLS warnings for anon/non-authenticated probes may appear in readonly checks and are acceptable if authenticated checks pass.
