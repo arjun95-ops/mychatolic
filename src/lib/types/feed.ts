@@ -45,6 +45,9 @@ export interface Comment {
   post_id: string;
   parent_id?: string;
   content: string;
+  image_url?: string;
+  likes_count?: number;
+  is_liked?: boolean;
   created_at: string;
   profile?: {
     id: string;

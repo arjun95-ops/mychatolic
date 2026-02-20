@@ -158,7 +158,7 @@ export function canReceiveMassInvite(profile?: Profile | null): boolean {
   const allowMassInvite = Boolean(profile.allow_mass_invite ?? true);
   const role = getProfileRoleKey(profile);
   const roleAllowed = role === 'umat' || role === 'katekumen';
-  return allowMassInvite && (roleAllowed || isProfileCatechumen(profile));
+  return allowMassInvite && roleAllowed;
 }
 
 export function canReceiveProfileChat(profile?: Profile | null): boolean {

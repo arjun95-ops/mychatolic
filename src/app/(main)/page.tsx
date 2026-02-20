@@ -84,6 +84,7 @@ type RadarParticipantCountRow = {
 };
 
 const PRIORITY_MODE_STORAGE_KEY = 'feed:priority-mode:v1';
+const FEED_SCOPE_STORAGE_KEY = 'feed:scope:v1';
 const SCOPE_MODE_META: Array<{ key: ScopeKey; label: string; icon: LucideIcon }> = [
   { key: 'all', label: 'All Feed', icon: Globe },
   { key: 'country', label: 'Negara', icon: Landmark },
@@ -93,6 +94,44 @@ const SCOPE_MODE_META: Array<{ key: ScopeKey; label: string; icon: LucideIcon }>
 
 function isPriorityMode(value: string): value is PriorityMode {
   return value === 'hot' || value === 'latest' || value === 'discussed';
+}
+
+type PersistedFeedScope = {
+  scopeKey: ScopeKey;
+  countryId: string;
+  countryName: string;
+  dioceseId: string;
+  dioceseName: string;
+  parishId: string;
+  parishName: string;
+};
+
+function isScopeKey(value: string): value is ScopeKey {
+  return value === 'all' || value === 'country' || value === 'diocese' || value === 'parish';
+}
+
+function normalizePersistedText(value: unknown) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function parsePersistedFeedScope(raw: string): PersistedFeedScope | null {
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const rawScopeKey = normalizePersistedText(parsed.scopeKey);
+    if (!isScopeKey(rawScopeKey)) return null;
+
+    return {
+      scopeKey: rawScopeKey,
+      countryId: normalizePersistedText(parsed.countryId),
+      countryName: normalizePersistedText(parsed.countryName),
+      dioceseId: normalizePersistedText(parsed.dioceseId),
+      dioceseName: normalizePersistedText(parsed.dioceseName),
+      parishId: normalizePersistedText(parsed.parishId),
+      parishName: normalizePersistedText(parsed.parishName),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function useDebouncedValue(value: string, delay = 250) {
@@ -481,6 +520,7 @@ export default function HomePage() {
   const [dioceseSearch, setDioceseSearch] = useState('');
   const [parishSearch, setParishSearch] = useState('');
   const [scopeKey, setScopeKey] = useState<ScopeKey>('all');
+  const [didLoadPersistedScope, setDidLoadPersistedScope] = useState(false);
   const [isScopeDialogOpen, setIsScopeDialogOpen] = useState(false);
   const [isPriorityDialogOpen, setIsPriorityDialogOpen] = useState(false);
   const [priorityMode, setPriorityMode] = useState<PriorityMode>(() => {
@@ -498,6 +538,28 @@ export default function HomePage() {
   const debouncedCountrySearch = useDebouncedValue(countrySearch);
   const debouncedDioceseSearch = useDebouncedValue(dioceseSearch);
   const debouncedParishSearch = useDebouncedValue(parishSearch);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(FEED_SCOPE_STORAGE_KEY);
+      if (raw) {
+        const persisted = parsePersistedFeedScope(raw);
+        if (persisted) {
+          setScopeKey(persisted.scopeKey);
+          setCountryId(persisted.countryId);
+          setCountryName(persisted.countryName);
+          setDioceseId(persisted.dioceseId);
+          setDioceseName(persisted.dioceseName);
+          setParishId(persisted.parishId);
+          setParishName(persisted.parishName);
+        }
+      }
+    } catch {
+      // Ignore storage read errors.
+    } finally {
+      setDidLoadPersistedScope(true);
+    }
+  }, []);
 
   useEffect(() => {
     if (!isScopeDialogOpen) return;
@@ -725,6 +787,24 @@ export default function HomePage() {
       ? null
       : `📍 dari ${activeScope.label}`;
   const hasPriority = priorityPosts.length > 0;
+
+  useEffect(() => {
+    if (!didLoadPersistedScope) return;
+    try {
+      const payload: PersistedFeedScope = {
+        scopeKey,
+        countryId: countryId.trim(),
+        countryName: countryName.trim(),
+        dioceseId: dioceseId.trim(),
+        dioceseName: dioceseName.trim(),
+        parishId: parishId.trim(),
+        parishName: parishName.trim(),
+      };
+      window.localStorage.setItem(FEED_SCOPE_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, [didLoadPersistedScope, scopeKey, countryId, countryName, dioceseId, dioceseName, parishId, parishName]);
 
   useEffect(() => {
     try {

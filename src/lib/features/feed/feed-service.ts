@@ -197,7 +197,118 @@ function mapPostRow(
   };
 }
 
+function mapCommentRow(
+  row: Record<string, unknown>,
+  options?: {
+    likesCount?: number;
+    isLiked?: boolean;
+  }
+): Comment {
+  const profile = getProfileRow(row.profiles);
+  const imageUrl = parseImageUrls(row.image_url)[0];
+
+  return {
+    id: row.id?.toString() ?? createRandomUUID(),
+    user_id: row.user_id?.toString() ?? '',
+    post_id: row.post_id?.toString() ?? '',
+    parent_id: row.parent_id?.toString() || undefined,
+    content: row.content?.toString() ?? '',
+    image_url: imageUrl,
+    likes_count: options?.likesCount ?? Number(row.likes_count ?? 0),
+    is_liked: options?.isLiked ?? Boolean(row.is_liked),
+    created_at: row.created_at?.toString() ?? new Date().toISOString(),
+    profile: profile
+      ? {
+          id: profile.id?.toString() ?? '',
+          full_name: profile.full_name?.toString(),
+          avatar_url: profile.avatar_url?.toString(),
+          role: profile.role?.toString(),
+        }
+      : undefined,
+  };
+}
+
 export class FeedService {
+  private static async getCommentLikeSummary(commentIds: string[], currentUserId?: string): Promise<{
+    counts: Map<string, number>;
+    liked: Set<string>;
+  }> {
+    const counts = new Map<string, number>();
+    const liked = new Set<string>();
+
+    if (commentIds.length === 0) {
+      return { counts, liked };
+    }
+
+    const uniqueCommentIds = [...new Set(commentIds)];
+    const rpcSummary = await supabase.rpc('get_comment_likes_summary', {
+      p_comment_ids: uniqueCommentIds,
+      p_user_id: currentUserId ?? null,
+    });
+
+    if (!rpcSummary.error) {
+      for (const row of (rpcSummary.data ?? []) as Array<{
+        comment_id?: string | null;
+        likes_count?: number | string | null;
+        is_liked?: boolean | null;
+      }>) {
+        const commentId = row.comment_id?.toString();
+        if (!commentId) continue;
+        counts.set(commentId, Number(row.likes_count ?? 0));
+        if (row.is_liked) {
+          liked.add(commentId);
+        }
+      }
+
+      return { counts, liked };
+    }
+
+    if (!isMissingSchemaObjectError(rpcSummary.error.message)) {
+      console.warn('FeedService.getCommentLikeSummary rpc query failed:', rpcSummary.error.message);
+    }
+
+    const countRows = await supabase
+      .from('comment_likes')
+      .select('comment_id')
+      .in('comment_id', uniqueCommentIds);
+
+    if (countRows.error) {
+      if (!isMissingSchemaObjectError(countRows.error.message)) {
+        console.warn('FeedService.getCommentLikeSummary count query failed:', countRows.error.message);
+      }
+      return { counts, liked };
+    }
+
+    for (const row of (countRows.data ?? []) as Array<{ comment_id?: string | null }>) {
+      const commentId = row.comment_id?.toString();
+      if (!commentId) continue;
+      counts.set(commentId, (counts.get(commentId) ?? 0) + 1);
+    }
+
+    if (currentUserId) {
+      const likedRows = await supabase
+        .from('comment_likes')
+        .select('comment_id')
+        .eq('user_id', currentUserId)
+        .in('comment_id', uniqueCommentIds);
+
+      if (likedRows.error) {
+        if (!isMissingSchemaObjectError(likedRows.error.message)) {
+          console.warn('FeedService.getCommentLikeSummary user flag query failed:', likedRows.error.message);
+        }
+        return { counts, liked };
+      }
+
+      for (const row of (likedRows.data ?? []) as Array<{ comment_id?: string | null }>) {
+        const commentId = row.comment_id?.toString();
+        if (!commentId) continue;
+        liked.add(commentId);
+      }
+    }
+
+    return { counts, liked };
+  }
+
   // Get posts with pagination
   static async getPosts(params: {
     page?: number;
@@ -469,6 +580,39 @@ export class FeedService {
     throw new Error(lastError || 'Gagal upload gambar');
   }
 
+  static async uploadCommentImage(userId: string, file: File): Promise<string> {
+    const extension = file.name.split('.').pop();
+    const safeExtension = extension ? `.${extension}` : '';
+    const filePath = `comments/${userId}/${Date.now()}-${createRandomToken(12)}${safeExtension}`;
+    const bucketCandidates = ['comment-images', 'post-images', 'posts', 'feed-images', 'avatars'];
+
+    let lastError: string | null = null;
+
+    for (const bucket of bucketCandidates) {
+      const uploadResult = await supabase.storage
+        .from(bucket)
+        .upload(filePath, file, { upsert: false });
+
+      if (!uploadResult.error) {
+        return supabase.storage.from(bucket).getPublicUrl(filePath).data.publicUrl;
+      }
+
+      const message = uploadResult.error.message.toLowerCase();
+      const canTryNextBucket =
+        message.includes('bucket') ||
+        message.includes('not found') ||
+        message.includes('does not exist');
+
+      if (!canTryNextBucket) {
+        throw new Error(uploadResult.error.message);
+      }
+
+      lastError = uploadResult.error.message;
+    }
+
+    throw new Error(lastError || 'Gagal upload gambar komentar');
+  }
+
   // Update post
   static async updatePost(postId: string, updates: Partial<Post>): Promise<Post> {
     const { data, error } = await supabase
@@ -519,6 +663,67 @@ export class FeedService {
 
     const count = await this.syncAggregateCount('likes', 'likes_count', postId);
     return { liked: !Boolean(existingLike?.id), count };
+  }
+
+  static async toggleCommentLike(
+    userId: string,
+    commentId: string,
+    postId: string
+  ): Promise<{ liked: boolean; count: number }> {
+    const existingLike = await supabase
+      .from('comment_likes')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('comment_id', commentId)
+      .maybeSingle();
+
+    if (existingLike.error) {
+      if (isMissingSchemaObjectError(existingLike.error.message)) {
+        throw new Error('Schema comment likes belum siap. Jalankan comments_likes_hotfix.sql');
+      }
+      throw new Error(existingLike.error.message);
+    }
+
+    if (existingLike.data?.id) {
+      const removeResult = await supabase.from('comment_likes').delete().eq('id', existingLike.data.id);
+      if (removeResult.error) {
+        throw new Error(removeResult.error.message);
+      }
+    } else {
+      let createResult = await supabase
+        .from('comment_likes')
+        .insert({ user_id: userId, comment_id: commentId, post_id: postId });
+
+      if (createResult.error && isMissingColumnError(createResult.error.message, 'post_id')) {
+        createResult = await supabase
+          .from('comment_likes')
+          .insert({ user_id: userId, comment_id: commentId });
+      }
+
+      if (createResult.error) {
+        if (isMissingSchemaObjectError(createResult.error.message)) {
+          throw new Error('Schema comment likes belum siap. Jalankan comments_likes_hotfix.sql');
+        }
+        throw new Error(createResult.error.message);
+      }
+    }
+
+    const countResult = await supabase
+      .from('comment_likes')
+      .select('id', { count: 'exact', head: true })
+      .eq('comment_id', commentId);
+
+    if (countResult.error) {
+      return {
+        liked: !Boolean(existingLike.data?.id),
+        count: !Boolean(existingLike.data?.id) ? 1 : 0,
+      };
+    }
+
+    return {
+      liked: !Boolean(existingLike.data?.id),
+      count: countResult.count ?? 0,
+    };
   }
 
   // Get post likes
@@ -615,11 +820,12 @@ export class FeedService {
     userId: string,
     postId: string,
     content: string,
-    options?: { parentId?: string; replyToName?: string }
+    options?: { parentId?: string; replyToName?: string; imageUrl?: string }
   ): Promise<Comment> {
     const trimmed = content.trim();
-    if (!trimmed) {
-      throw new Error('Komentar tidak boleh kosong');
+    const normalizedImageUrl = options?.imageUrl?.trim();
+    if (!trimmed && !normalizedImageUrl) {
+      throw new Error('Komentar atau gambar tidak boleh kosong');
     }
 
     const selectComment = `
@@ -632,42 +838,76 @@ export class FeedService {
       )
     `;
 
-    const firstInsertPayload: Record<string, unknown> = {
+    const mentionPrefix =
+      options?.replyToName && !trimmed.startsWith(`@${options.replyToName}`)
+        ? `@${options.replyToName} `
+        : '';
+
+    const insertPayload: Record<string, unknown> = {
       user_id: userId,
       post_id: postId,
-      content: trimmed,
+      content: trimmed.length > 0 ? trimmed : ' ',
     };
 
     if (options?.parentId) {
-      firstInsertPayload.parent_id = options.parentId;
+      insertPayload.parent_id = options.parentId;
+    }
+
+    if (normalizedImageUrl) {
+      insertPayload.image_url = normalizedImageUrl;
     }
 
     let insertResult = await supabase
       .from('comments')
-      .insert(firstInsertPayload)
+      .insert(insertPayload)
       .select(selectComment)
       .single();
+    let triedParentFallback = false;
+    let triedImageFallback = false;
 
-    // Backward compatibility: some environments may not have `parent_id` yet.
-    if (
-      insertResult.error &&
-      options?.parentId &&
-      isMissingColumnError(insertResult.error.message, 'parent_id')
-    ) {
-      const mentionPrefix =
-        options.replyToName && !trimmed.startsWith(`@${options.replyToName}`)
-          ? `@${options.replyToName} `
-          : '';
+    // Backward compatibility: some environments may not have `parent_id` or `image_url`.
+    while (insertResult.error) {
+      if (
+        !triedParentFallback &&
+        options?.parentId &&
+        isMissingColumnError(insertResult.error.message, 'parent_id')
+      ) {
+        triedParentFallback = true;
+        delete insertPayload.parent_id;
+        if (mentionPrefix) {
+          const baseContent = insertPayload.content?.toString().trim() ?? '';
+          insertPayload.content = `${mentionPrefix}${baseContent}`.trim() || mentionPrefix.trim();
+        }
 
-      insertResult = await supabase
-        .from('comments')
-        .insert({
-          user_id: userId,
-          post_id: postId,
-          content: `${mentionPrefix}${trimmed}`.trim(),
-        })
-        .select(selectComment)
-        .single();
+        insertResult = await supabase
+          .from('comments')
+          .insert(insertPayload)
+          .select(selectComment)
+          .single();
+        continue;
+      }
+
+      if (
+        !triedImageFallback &&
+        normalizedImageUrl &&
+        isMissingColumnError(insertResult.error.message, 'image_url')
+      ) {
+        triedImageFallback = true;
+        delete insertPayload.image_url;
+        const baseContent = insertPayload.content?.toString().trim() ?? '';
+        insertPayload.content = baseContent
+          ? `${baseContent}\n[image] ${normalizedImageUrl}`
+          : `[image] ${normalizedImageUrl}`;
+
+        insertResult = await supabase
+          .from('comments')
+          .insert(insertPayload)
+          .select(selectComment)
+          .single();
+        continue;
+      }
+
+      break;
     }
 
     if (insertResult.error || !insertResult.data) {
@@ -675,7 +915,7 @@ export class FeedService {
     }
 
     await this.syncAggregateCount('comments', 'comments_count', postId);
-    return insertResult.data as Comment;
+    return mapCommentRow(insertResult.data as Record<string, unknown>);
   }
 
   // Get post comments
@@ -706,19 +946,49 @@ export class FeedService {
     }
 
     const rows = (data ?? []) as Record<string, unknown>[];
-    if (!currentUserId) {
-      return rows as unknown as Comment[];
+
+    if (currentUserId) {
+      const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
+      const filteredRows = rows.filter((row) => !hiddenUserIds.has(row.user_id?.toString() ?? ''));
+      const commentIds = filteredRows.map((row) => row.id?.toString() ?? '').filter((id) => id.length > 0);
+      const likeSummary = await this.getCommentLikeSummary(commentIds, currentUserId);
+      return filteredRows.map((row) => {
+        const commentId = row.id?.toString() ?? '';
+        return mapCommentRow(row, {
+          likesCount: likeSummary.counts.get(commentId) ?? 0,
+          isLiked: likeSummary.liked.has(commentId),
+        });
+      });
     }
 
-    const { hiddenUserIds } = await this.getBlockedUserSets(currentUserId);
-    return rows.filter((row) => !hiddenUserIds.has(row.user_id?.toString() ?? '')) as unknown as Comment[];
+    const commentIds = rows.map((row) => row.id?.toString() ?? '').filter((id) => id.length > 0);
+    const likeSummary = await this.getCommentLikeSummary(commentIds);
+    return rows.map((row) => {
+      const commentId = row.id?.toString() ?? '';
+      return mapCommentRow(row, {
+        likesCount: likeSummary.counts.get(commentId) ?? 0,
+        isLiked: likeSummary.liked.has(commentId),
+      });
+    });
   }
 
   // Delete comment
   static async deleteComment(commentId: string): Promise<void> {
+    const commentResult = await supabase
+      .from('comments')
+      .select('post_id')
+      .eq('id', commentId)
+      .single();
+
+    const postId = commentResult.data?.post_id?.toString() ?? '';
+
     const { error } = await supabase.from('comments').delete().eq('id', commentId);
     if (error) {
       throw new Error(error.message);
+    }
+
+    if (postId) {
+      await this.syncAggregateCount('comments', 'comments_count', postId);
     }
   }
 

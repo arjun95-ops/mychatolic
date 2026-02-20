@@ -2,17 +2,28 @@
 
 'use client';
 
-import { useEffect, useState, type ComponentType, type FormEvent, type MouseEvent } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ComponentType,
+  type FormEvent,
+  type KeyboardEvent,
+  type MouseEvent,
+} from 'react';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import {
   Bookmark,
   ChevronLeft,
   ChevronRight,
   Flag,
   Flame,
+  ImagePlus,
   MessageCircle,
   MoreHorizontal,
   Pencil,
@@ -20,6 +31,7 @@ import {
   Send,
   Trash2,
   UserX,
+  X,
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { id as localeId } from 'date-fns/locale';
@@ -32,6 +44,7 @@ import {
   usePostLikes,
   useReportComment,
   useReportPost,
+  useToggleCommentLike,
   useUpdatePost,
   useToggleLike,
   useToggleRepost,
@@ -41,7 +54,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
-import type { Post } from '@/lib/types';
+import type { Comment, Post } from '@/lib/types';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import {
   DropdownMenu,
@@ -51,6 +64,8 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/lib/features/auth/use-auth';
 import { supabase } from '@/lib/supabase/client';
+import { FeedService } from '@/lib/features/feed/feed-service';
+import { UPLOAD_LIMITS } from '@/lib/constants';
 
 const REPORT_REASONS = ['Spam', 'Ujaran Kebencian', 'Penipuan', 'Informasi Palsu', 'Lainnya'];
 
@@ -59,9 +74,21 @@ interface PostCardProps {
   showFullImage?: boolean;
   onClick?: () => void;
   originText?: string | null;
+  initialCommentsOpen?: boolean;
 }
 
-export function PostCard({ post, showFullImage = false, onClick, originText }: PostCardProps) {
+type CommentThread = {
+  root: Comment;
+  replies: Comment[];
+};
+
+export function PostCard({
+  post,
+  showFullImage = false,
+  onClick,
+  originText,
+  initialCommentsOpen = false,
+}: PostCardProps) {
   const { user, profile } = useAuth();
   const queryClient = useQueryClient();
   const { mutateAsync: toggleLike, isPending: isLiking } = useToggleLike();
@@ -72,6 +99,7 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
   const { mutateAsync: reportPost, isPending: isReportingPost } = useReportPost();
   const { mutateAsync: blockUser, isPending: isBlockingUser } = useBlockUser();
   const { mutateAsync: addComment, isPending: isCommenting } = useAddComment();
+  const { mutateAsync: toggleCommentLike, isPending: isTogglingCommentLike } = useToggleCommentLike();
   const { mutateAsync: deleteComment, isPending: isDeletingComment } = useDeleteComment();
   const { mutateAsync: reportComment, isPending: isReportingComment } = useReportComment();
 
@@ -95,12 +123,19 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
   const [imageIndex, setImageIndex] = useState(0);
   const [likeAnimationKey, setLikeAnimationKey] = useState(0);
   const [isCommentsOpen, setIsCommentsOpen] = useState(false);
+  const [hasAutoOpenedComments, setHasAutoOpenedComments] = useState(false);
   const [commentText, setCommentText] = useState('');
+  const [commentImageFile, setCommentImageFile] = useState<File | null>(null);
+  const [commentImagePreviewUrl, setCommentImagePreviewUrl] = useState<string | null>(null);
+  const [isUploadingCommentImage, setIsUploadingCommentImage] = useState(false);
+  const commentImageInputRef = useRef<HTMLInputElement>(null);
   const [replyTarget, setReplyTarget] = useState<{ id: string; name: string } | null>(null);
+  const [expandedReplyParents, setExpandedReplyParents] = useState<Set<string>>(new Set());
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [isReportPostDialogOpen, setIsReportPostDialogOpen] = useState(false);
   const [isReportCommentDialogOpen, setIsReportCommentDialogOpen] = useState(false);
+  const [commentImageViewer, setCommentImageViewer] = useState<{ url: string; alt: string } | null>(null);
   const [isSharingLink, setIsSharingLink] = useState(false);
   const [editCaption, setEditCaption] = useState(post.caption?.trim() ?? '');
   const [reportPostReason, setReportPostReason] = useState(REPORT_REASONS[0]);
@@ -135,6 +170,136 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
   const postTimeLabel = Number.isNaN(postCreatedAt.getTime())
     ? '-'
     : formatDistanceToNow(postCreatedAt, { addSuffix: true, locale: localeId });
+  const { commentThreads, commentRootById } = useMemo(() => {
+    const byId = new Map<string, Comment>();
+    for (const comment of comments) {
+      byId.set(comment.id, comment);
+    }
+
+    const resolveRootId = (comment: Comment): string => {
+      const seen = new Set<string>([comment.id]);
+      let cursor = comment;
+
+      while (cursor.parent_id) {
+        const parent = byId.get(cursor.parent_id);
+        if (!parent || seen.has(parent.id)) {
+          break;
+        }
+        seen.add(parent.id);
+        cursor = parent;
+      }
+
+      return cursor.id;
+    };
+
+    const rootOrder: string[] = [];
+    const seenRoots = new Set<string>();
+    const rootByCommentId = new Map<string, string>();
+    const threads = new Map<string, CommentThread>();
+
+    for (const comment of comments) {
+      const rootId = resolveRootId(comment);
+      rootByCommentId.set(comment.id, rootId);
+
+      if (!seenRoots.has(rootId)) {
+        seenRoots.add(rootId);
+        rootOrder.push(rootId);
+      }
+
+      const rootComment = byId.get(rootId) ?? comment;
+      const existingThread = threads.get(rootId);
+      if (!existingThread) {
+        threads.set(rootId, {
+          root: rootComment,
+          replies: comment.id === rootId ? [] : [comment],
+        });
+        continue;
+      }
+
+      if (comment.id !== rootId) {
+        existingThread.replies.push(comment);
+      }
+    }
+
+    const orderedThreads = rootOrder
+      .map((rootId) => threads.get(rootId))
+      .filter((thread): thread is CommentThread => Boolean(thread));
+
+    return {
+      commentThreads: orderedThreads,
+      commentRootById: rootByCommentId,
+    };
+  }, [comments]);
+  const isSubmittingComment = isCommenting || isUploadingCommentImage;
+  const canSubmitComment = commentText.trim() !== '' || Boolean(commentImageFile);
+
+  useEffect(() => {
+    setImageIndex(0);
+    setIsCommentsOpen(false);
+    setHasAutoOpenedComments(false);
+    setCommentText('');
+    setReplyTarget(null);
+    setExpandedReplyParents(new Set());
+    setCommentImageFile(null);
+    setCommentImagePreviewUrl((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      return null;
+    });
+    if (commentImageInputRef.current) {
+      commentImageInputRef.current.value = '';
+    }
+  }, [post.id]);
+
+  useEffect(() => {
+    if (!initialCommentsOpen || hasAutoOpenedComments) return;
+    setIsCommentsOpen(true);
+    setHasAutoOpenedComments(true);
+  }, [hasAutoOpenedComments, initialCommentsOpen]);
+
+  const clearCommentImage = () => {
+    setCommentImageFile(null);
+    setCommentImagePreviewUrl((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      return null;
+    });
+
+    if (commentImageInputRef.current) {
+      commentImageInputRef.current.value = '';
+    }
+  };
+
+  const handleCommentImageSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    const isAllowedImageType = UPLOAD_LIMITS.ALLOWED_IMAGE_TYPES.some((allowedType) => allowedType === file.type);
+    if (!isAllowedImageType) {
+      toast.error('Format gambar harus JPG, PNG, GIF, atau WEBP');
+      event.target.value = '';
+      return;
+    }
+
+    if (file.size > UPLOAD_LIMITS.MAX_IMAGE_SIZE) {
+      toast.error('Ukuran file maksimal 5MB');
+      event.target.value = '';
+      return;
+    }
+
+    setCommentImageFile(file);
+    setCommentImagePreviewUrl((current) => {
+      if (current) {
+        URL.revokeObjectURL(current);
+      }
+      return URL.createObjectURL(file);
+    });
+    event.target.value = '';
+  };
 
   const handleLike = async (event: MouseEvent) => {
     event.stopPropagation();
@@ -195,20 +360,60 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
   const handleSubmitComment = async (event: FormEvent) => {
     event.preventDefault();
     const content = commentText.trim();
-    if (!content) return;
+    if (!content && !commentImageFile) return;
+    const targetParentId = replyTarget?.id;
 
     try {
+      let uploadedImageUrl: string | undefined;
+      if (commentImageFile) {
+        if (!user?.id) {
+          throw new Error('Anda harus login untuk upload gambar komentar');
+        }
+
+        setIsUploadingCommentImage(true);
+        uploadedImageUrl = await FeedService.uploadCommentImage(user.id, commentImageFile);
+      }
+
       await addComment({
         postId: post.id,
         content,
-        parentId: replyTarget?.id,
+        parentId: targetParentId,
         replyToName: replyTarget?.name,
+        imageUrl: uploadedImageUrl,
       });
+      if (targetParentId) {
+        setExpandedReplyParents((prev) => {
+          const next = new Set(prev);
+          next.add(targetParentId);
+          return next;
+        });
+      }
       setCommentText('');
       setReplyTarget(null);
+      clearCommentImage();
     } catch (error) {
       console.error('Comment error:', error);
+      toast.error(error instanceof Error ? error.message : 'Gagal mengirim komentar');
+    } finally {
+      setIsUploadingCommentImage(false);
     }
+  };
+
+  const handleCommentInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Enter' || event.shiftKey) {
+      return;
+    }
+
+    if (event.nativeEvent.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+    if (!canSubmitComment || isSubmittingComment) {
+      return;
+    }
+
+    event.currentTarget.form?.requestSubmit();
   };
 
   const handleDeleteComment = async (commentId: string, commentUserId?: string) => {
@@ -221,6 +426,14 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
       await deleteComment({ postId: post.id, commentId });
     } catch (error) {
       console.error('Delete comment error:', error);
+    }
+  };
+
+  const handleToggleCommentLike = async (commentId: string) => {
+    try {
+      await toggleCommentLike({ postId: post.id, commentId });
+    } catch (error) {
+      console.error('Comment like error:', error);
     }
   };
 
@@ -311,12 +524,32 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
           queryClient.invalidateQueries({ queryKey: ['posts'] });
         }
       )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'comment_likes',
+          filter: `post_id=eq.${post.id}`,
+        },
+        () => {
+          queryClient.invalidateQueries({ queryKey: ['comments', post.id] });
+        }
+      )
       .subscribe();
 
     return () => {
       void supabase.removeChannel(channel);
     };
   }, [isCommentsOpen, post.id, queryClient]);
+
+  useEffect(() => {
+    return () => {
+      if (commentImagePreviewUrl) {
+        URL.revokeObjectURL(commentImagePreviewUrl);
+      }
+    };
+  }, [commentImagePreviewUrl]);
 
   return (
     <>
@@ -528,6 +761,8 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
           if (!nextOpen) {
             setReplyTarget(null);
             setCommentText('');
+            setExpandedReplyParents(new Set());
+            clearCommentImage();
           }
         }}
       >
@@ -576,88 +811,294 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
                 </div>
               ) : (
                 <div className="space-y-4">
-                  {comments.map((comment) => {
-                    const name = comment.profile?.full_name?.trim() || 'Umat';
-                    const commentInitials =
-                      name
+                  {commentThreads.map((thread) => {
+                    const isRepliesExpanded = expandedReplyParents.has(thread.root.id);
+                    const rootName = thread.root.profile?.full_name?.trim() || 'Umat';
+                    const rootInitials =
+                      rootName
                         .split(' ')
                         .map((part) => part[0])
                         .join('')
                         .toUpperCase()
                         .slice(0, 2) || 'US';
-                    const isMyComment = Boolean(user?.id && user.id === comment.user_id);
-                    const isReply = Boolean(comment.parent_id);
-                    const commentCreatedAt = new Date(comment.created_at);
-                    const commentTimeLabel = Number.isNaN(commentCreatedAt.getTime())
+                    const isMyRootComment = Boolean(user?.id && user.id === thread.root.user_id);
+                    const rootCreatedAt = new Date(thread.root.created_at);
+                    const rootTimeLabel = Number.isNaN(rootCreatedAt.getTime())
                       ? '-'
-                      : formatDistanceToNow(commentCreatedAt, { addSuffix: true, locale: localeId });
+                      : formatDistanceToNow(rootCreatedAt, { addSuffix: true, locale: localeId });
+                    const rootContent = thread.root.content?.trim() ?? '';
+
+                    const handleReplyToComment = (comment: Comment, name: string) => {
+                      const rootId = commentRootById.get(comment.id) ?? comment.parent_id ?? comment.id;
+                      setReplyTarget({ id: rootId, name });
+                      setExpandedReplyParents((prev) => {
+                        const next = new Set(prev);
+                        next.add(rootId);
+                        return next;
+                      });
+                    };
 
                     return (
-                      <div key={comment.id} className={cn('flex items-start gap-3', isReply && 'ml-5')}>
-                        <Avatar className="h-8 w-8 border border-border">
-                          <AvatarImage src={comment.profile?.avatar_url} alt={name} />
-                          <AvatarFallback className="text-[10px]">{commentInitials}</AvatarFallback>
-                        </Avatar>
+                      <div key={thread.root.id} className="space-y-2">
+                        <div className="flex items-start gap-3">
+                          <Avatar className="h-8 w-8 border border-border">
+                            <AvatarImage src={thread.root.profile?.avatar_url} alt={rootName} />
+                            <AvatarFallback className="text-[10px]">{rootInitials}</AvatarFallback>
+                          </Avatar>
 
-                        <div className={cn('min-w-0 flex-1', isReply && 'border-l border-border/60 pl-3')}>
-                          <div className="flex items-center gap-2">
-                            <p className="truncate text-[13px] font-semibold">{name}</p>
-                            <span className="text-[11px] text-muted-foreground">{commentTimeLabel}</span>
-                          </div>
-                          {isReply && (
-                            <p className="mt-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
-                              Balasan
-                            </p>
-                          )}
-                          <p className="mt-1 whitespace-pre-wrap text-[14px] leading-relaxed text-foreground">
-                            {comment.content}
-                          </p>
-
-                          <div className="mt-1.5 flex items-center justify-between">
-                            <button
-                              type="button"
-                              onClick={() => setReplyTarget({ id: comment.id, name })}
-                              className="text-[11px] font-semibold text-muted-foreground transition-colors hover:text-primary"
-                            >
-                              Balas
-                            </button>
-
-                            <DropdownMenu>
-                              <DropdownMenuTrigger asChild>
-                                <Button
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <p className="truncate text-[13px] font-semibold">{rootName}</p>
+                              <span className="text-[11px] text-muted-foreground">{rootTimeLabel}</span>
+                            </div>
+                            {rootContent.length > 0 && (
+                              <p className="mt-1 whitespace-pre-wrap text-[14px] leading-relaxed text-foreground">
+                                {thread.root.content}
+                              </p>
+                            )}
+                            {thread.root.image_url && (
+                              <div className="mt-2 w-fit max-w-[min(78vw,320px)] overflow-hidden rounded-xl border border-border/70 bg-muted/20 sm:max-w-[360px]">
+                                <button
                                   type="button"
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-7 w-7 rounded-full text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                                  onClick={() =>
+                                    setCommentImageViewer({
+                                      url: thread.root.image_url || '',
+                                      alt: `Lampiran komentar ${rootName}`,
+                                    })
+                                  }
+                                  className="inline-block cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
                                 >
-                                  <MoreHorizontal className="h-3.5 w-3.5" />
-                                </Button>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align="end" className="w-44">
-                                {isMyComment ? (
-                                  <DropdownMenuItem
-                                    disabled={isDeletingComment}
-                                    onClick={() => handleDeleteComment(comment.id, comment.user_id)}
+                                  <img
+                                    src={thread.root.image_url}
+                                    alt="Lampiran komentar"
+                                    className="block h-auto max-h-[320px] w-auto max-w-full object-contain transition-transform duration-200 hover:scale-[1.01]"
+                                    loading="lazy"
+                                  />
+                                </button>
+                              </div>
+                            )}
+
+                            <div className="mt-1.5 flex items-center justify-between">
+                              <div className="flex items-center gap-3">
+                                <button
+                                  type="button"
+                                  onClick={() => handleReplyToComment(thread.root, rootName)}
+                                  className="text-[11px] font-semibold text-muted-foreground transition-colors hover:text-primary"
+                                >
+                                  Balas
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleCommentLike(thread.root.id)}
+                                  disabled={isTogglingCommentLike}
+                                  className={cn(
+                                    'inline-flex items-center gap-1 text-[11px] font-semibold transition-colors',
+                                    thread.root.is_liked
+                                      ? 'text-[#FF3B00] hover:text-[#FF3B00]'
+                                      : 'text-muted-foreground hover:text-primary'
+                                  )}
+                                >
+                                  <Flame
+                                    className={cn(
+                                      'h-3.5 w-3.5',
+                                      thread.root.is_liked && '[&>path]:fill-current [&>path]:stroke-current'
+                                    )}
+                                  />
+                                  <span>{thread.root.likes_count && thread.root.likes_count > 0 ? thread.root.likes_count : 'Suka'}</span>
+                                </button>
+                              </div>
+
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-7 w-7 rounded-full text-muted-foreground hover:bg-muted/60 hover:text-foreground"
                                   >
-                                    <Trash2 className="mr-2 h-4 w-4 text-destructive" />
-                                    Hapus komentar
-                                  </DropdownMenuItem>
-                                ) : (
-                                  <DropdownMenuItem
-                                    onClick={() => {
-                                      setReportCommentReason(REPORT_REASONS[0]);
-                                      setReportCommentTarget({ id: comment.id, userName: name });
-                                      setIsReportCommentDialogOpen(true);
-                                    }}
-                                  >
-                                    <Flag className="mr-2 h-4 w-4" />
-                                    Laporkan komentar
-                                  </DropdownMenuItem>
-                                )}
-                              </DropdownMenuContent>
-                            </DropdownMenu>
+                                    <MoreHorizontal className="h-3.5 w-3.5" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-44">
+                                  {isMyRootComment ? (
+                                    <DropdownMenuItem
+                                      disabled={isDeletingComment}
+                                      onClick={() => handleDeleteComment(thread.root.id, thread.root.user_id)}
+                                    >
+                                      <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                                      Hapus komentar
+                                    </DropdownMenuItem>
+                                  ) : (
+                                    <DropdownMenuItem
+                                      onClick={() => {
+                                        setReportCommentReason(REPORT_REASONS[0]);
+                                        setReportCommentTarget({ id: thread.root.id, userName: rootName });
+                                        setIsReportCommentDialogOpen(true);
+                                      }}
+                                    >
+                                      <Flag className="mr-2 h-4 w-4" />
+                                      Laporkan komentar
+                                    </DropdownMenuItem>
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+
+                            {thread.replies.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedReplyParents((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(thread.root.id)) {
+                                      next.delete(thread.root.id);
+                                    } else {
+                                      next.add(thread.root.id);
+                                    }
+                                    return next;
+                                  })
+                                }
+                                className="mt-1.5 text-[11px] font-semibold text-primary transition-colors hover:text-primary/80"
+                              >
+                                {isRepliesExpanded
+                                  ? 'Sembunyikan balasan'
+                                  : `Lihat ${thread.replies.length} balasan`}
+                              </button>
+                            )}
                           </div>
                         </div>
+
+                        {isRepliesExpanded && thread.replies.length > 0 && (
+                          <div className="ml-11 space-y-2">
+                            {thread.replies.map((reply) => {
+                              const replyName = reply.profile?.full_name?.trim() || 'Umat';
+                              const replyInitials =
+                                replyName
+                                  .split(' ')
+                                  .map((part) => part[0])
+                                  .join('')
+                                  .toUpperCase()
+                                  .slice(0, 2) || 'US';
+                              const isMyReply = Boolean(user?.id && user.id === reply.user_id);
+                              const replyCreatedAt = new Date(reply.created_at);
+                              const replyTimeLabel = Number.isNaN(replyCreatedAt.getTime())
+                                ? '-'
+                                : formatDistanceToNow(replyCreatedAt, { addSuffix: true, locale: localeId });
+                              const replyContent = reply.content?.trim() ?? '';
+
+                              return (
+                                <div key={reply.id} className="flex items-start gap-3">
+                                  <Avatar className="h-7 w-7 border border-border">
+                                    <AvatarImage src={reply.profile?.avatar_url} alt={replyName} />
+                                    <AvatarFallback className="text-[10px]">{replyInitials}</AvatarFallback>
+                                  </Avatar>
+
+                                  <div className="min-w-0 flex-1 border-l border-border/60 pl-3">
+                                    <div className="flex items-center gap-2">
+                                      <p className="truncate text-[12px] font-semibold">{replyName}</p>
+                                      <span className="text-[11px] text-muted-foreground">{replyTimeLabel}</span>
+                                    </div>
+                                    <p className="mt-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+                                      Balasan
+                                    </p>
+                                    {replyContent.length > 0 && (
+                                      <p className="mt-1 whitespace-pre-wrap text-[13px] leading-relaxed text-foreground">
+                                        {reply.content}
+                                      </p>
+                                    )}
+                                    {reply.image_url && (
+                                      <div className="mt-2 w-fit max-w-[min(70vw,260px)] overflow-hidden rounded-xl border border-border/70 bg-muted/20 sm:max-w-[300px]">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setCommentImageViewer({
+                                              url: reply.image_url || '',
+                                              alt: `Lampiran balasan ${replyName}`,
+                                            })
+                                          }
+                                          className="inline-block cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                                        >
+                                          <img
+                                            src={reply.image_url}
+                                            alt="Lampiran balasan"
+                                            className="block h-auto max-h-[240px] w-auto max-w-full object-contain transition-transform duration-200 hover:scale-[1.01]"
+                                            loading="lazy"
+                                          />
+                                        </button>
+                                      </div>
+                                    )}
+
+                                    <div className="mt-1.5 flex items-center justify-between">
+                                      <div className="flex items-center gap-3">
+                                        <button
+                                          type="button"
+                                          onClick={() => handleReplyToComment(reply, replyName)}
+                                          className="text-[11px] font-semibold text-muted-foreground transition-colors hover:text-primary"
+                                        >
+                                          Balas
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleToggleCommentLike(reply.id)}
+                                          disabled={isTogglingCommentLike}
+                                          className={cn(
+                                            'inline-flex items-center gap-1 text-[11px] font-semibold transition-colors',
+                                            reply.is_liked
+                                              ? 'text-[#FF3B00] hover:text-[#FF3B00]'
+                                              : 'text-muted-foreground hover:text-primary'
+                                          )}
+                                        >
+                                          <Flame
+                                            className={cn(
+                                              'h-3.5 w-3.5',
+                                              reply.is_liked && '[&>path]:fill-current [&>path]:stroke-current'
+                                            )}
+                                          />
+                                          <span>{reply.likes_count && reply.likes_count > 0 ? reply.likes_count : 'Suka'}</span>
+                                        </button>
+                                      </div>
+
+                                      <DropdownMenu>
+                                        <DropdownMenuTrigger asChild>
+                                          <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="icon"
+                                            className="h-7 w-7 rounded-full text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                                          >
+                                            <MoreHorizontal className="h-3.5 w-3.5" />
+                                          </Button>
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent align="end" className="w-44">
+                                          {isMyReply ? (
+                                            <DropdownMenuItem
+                                              disabled={isDeletingComment}
+                                              onClick={() => handleDeleteComment(reply.id, reply.user_id)}
+                                            >
+                                              <Trash2 className="mr-2 h-4 w-4 text-destructive" />
+                                              Hapus komentar
+                                            </DropdownMenuItem>
+                                          ) : (
+                                            <DropdownMenuItem
+                                              onClick={() => {
+                                                setReportCommentReason(REPORT_REASONS[0]);
+                                                setReportCommentTarget({ id: reply.id, userName: replyName });
+                                                setIsReportCommentDialogOpen(true);
+                                              }}
+                                            >
+                                              <Flag className="mr-2 h-4 w-4" />
+                                              Laporkan komentar
+                                            </DropdownMenuItem>
+                                          )}
+                                        </DropdownMenuContent>
+                                      </DropdownMenu>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -696,31 +1137,101 @@ export function PostCard({ post, showFullImage = false, onClick, originText }: P
 
               <form
                 onSubmit={handleSubmitComment}
-                className="flex items-center gap-2 rounded-2xl border border-border bg-background px-3 py-2"
+                className="flex items-end gap-2 rounded-2xl border border-border bg-background px-3 py-2"
               >
+                <input
+                  ref={commentImageInputRef}
+                  type="file"
+                  accept={UPLOAD_LIMITS.ALLOWED_IMAGE_TYPES.join(',')}
+                  onChange={handleCommentImageSelect}
+                  className="hidden"
+                  disabled={isSubmittingComment}
+                />
                 <Avatar className="h-9 w-9 border border-border">
                   <AvatarImage src={profile?.avatar_url} alt={viewerName} />
                   <AvatarFallback className="text-[10px]">{viewerInitials}</AvatarFallback>
                 </Avatar>
-                <Input
-                  value={commentText}
-                  onChange={(event) => setCommentText(event.target.value)}
-                  placeholder={replyTarget ? `Balas ${replyTarget.name}...` : 'Tulis komentar...'}
-                  disabled={isCommenting}
-                  className="h-10 border-0 bg-transparent px-0 shadow-none focus-visible:ring-0"
-                />
+                <div className="min-w-0 flex-1">
+                  <Textarea
+                    value={commentText}
+                    onChange={(event) => setCommentText(event.target.value)}
+                    onKeyDown={handleCommentInputKeyDown}
+                    rows={1}
+                    placeholder={replyTarget ? `Balas ${replyTarget.name}...` : 'Tulis komentar...'}
+                    disabled={isSubmittingComment}
+                    className="min-h-[40px] max-h-28 resize-none border-0 bg-transparent px-0 py-2 text-sm shadow-none focus-visible:ring-0"
+                  />
+                  {commentImagePreviewUrl && (
+                    <div className="mt-1.5 inline-flex items-center gap-2 rounded-lg border border-border bg-muted/35 px-2 py-1">
+                      <img
+                        src={commentImagePreviewUrl}
+                        alt="Preview gambar komentar"
+                        className="h-10 w-10 rounded object-cover"
+                      />
+                      <span className="max-w-[180px] truncate text-[11px] text-muted-foreground">
+                        {commentImageFile?.name ?? 'Gambar siap dikirim'}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 rounded-full"
+                        onClick={clearCommentImage}
+                        disabled={isSubmittingComment}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  )}
+                  <p className="mt-1 text-[10px] text-muted-foreground">Enter kirim, Shift+Enter baris baru</p>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-9 w-9 rounded-xl text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                  onClick={() => commentImageInputRef.current?.click()}
+                  disabled={isSubmittingComment}
+                >
+                  <ImagePlus className="h-4 w-4" />
+                </Button>
                 <Button
                   type="submit"
                   variant="ghost"
                   size="sm"
-                  disabled={isCommenting || commentText.trim() === ''}
+                  disabled={isSubmittingComment || !canSubmitComment}
                   className="h-9 rounded-xl px-3 font-semibold text-primary hover:bg-primary/10 hover:text-primary"
                 >
-                  Kirim
+                  {isUploadingCommentImage ? 'Upload...' : isCommenting ? 'Kirim...' : 'Kirim'}
                 </Button>
               </form>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(commentImageViewer)}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) {
+            setCommentImageViewer(null);
+          }
+        }}
+      >
+        <DialogContent className="w-[min(96vw,980px)] max-h-[92vh] gap-0 overflow-hidden border-border/60 bg-black/95 p-0 [&>button]:text-white [&>button]:hover:bg-white/10">
+          <DialogHeader className="sr-only">
+            <DialogTitle>Pratinjau gambar komentar</DialogTitle>
+            <DialogDescription>Lihat gambar komentar dalam ukuran penuh.</DialogDescription>
+          </DialogHeader>
+          {commentImageViewer && (
+            <div className="flex items-center justify-center bg-black p-2 sm:p-4">
+              <img
+                src={commentImageViewer.url}
+                alt={commentImageViewer.alt}
+                className="max-h-[86vh] w-auto max-w-full object-contain"
+              />
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 

@@ -521,7 +521,13 @@ export function useAddComment() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (data: { postId: string; content: string; parentId?: string; replyToName?: string }) => {
+    mutationFn: async (data: {
+      postId: string;
+      content: string;
+      parentId?: string;
+      replyToName?: string;
+      imageUrl?: string;
+    }) => {
       if (!user?.id) {
         throw new Error('You must be logged in');
       }
@@ -529,6 +535,7 @@ export function useAddComment() {
       return await FeedService.addComment(user.id, data.postId, data.content, {
         parentId: data.parentId,
         replyToName: data.replyToName,
+        imageUrl: data.imageUrl,
       });
     },
     onSuccess: (_data, variables) => {
@@ -568,6 +575,60 @@ export function useAddComment() {
   });
 }
 
+export function useToggleCommentLike() {
+  const { user } = useAuth();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (data: { postId: string; commentId: string }) => {
+      if (!user?.id) {
+        throw new Error('You must be logged in');
+      }
+
+      return await FeedService.toggleCommentLike(user.id, data.commentId, data.postId);
+    },
+    onMutate: async ({ postId, commentId }) => {
+      await queryClient.cancelQueries({ queryKey: ['comments', postId] });
+
+      const previousComments = queryClient.getQueriesData({ queryKey: ['comments', postId] });
+
+      const toggleComment = (comment: Comment) => {
+        if (comment.id !== commentId) return comment;
+        return toggleCommentLikeState(comment);
+      };
+
+      queryClient.setQueriesData({ queryKey: ['comments', postId] }, (old: any) => {
+        if (Array.isArray(old)) {
+          return old.map(toggleComment);
+        }
+
+        if (!old?.pages) {
+          return old;
+        }
+
+        return {
+          ...old,
+          pages: old.pages.map((page: any) => {
+            if (!Array.isArray(page)) return page;
+            return page.map(toggleComment);
+          }),
+        };
+      });
+
+      return { previousComments, postId };
+    },
+    onError: (error: Error, _variables, context) => {
+      context?.previousComments?.forEach(([key, value]) => {
+        queryClient.setQueryData(key, value);
+      });
+      toast.error(error.message);
+    },
+    onSettled: (_result, _error, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['comments', variables.postId] });
+    },
+  });
+}
+
 export function useDeleteComment() {
   const queryClient = useQueryClient();
 
@@ -578,9 +639,57 @@ export function useDeleteComment() {
     },
     onSuccess: ({ postId, commentId }) => {
       toast.success('Komentar dihapus');
+      let removedCount = 1;
+
+      const collectCommentRows = (data: unknown): Array<{ id: string; parent_id?: string }> => {
+        if (Array.isArray(data)) {
+          return data.filter((item): item is { id: string; parent_id?: string } => Boolean(item?.id));
+        }
+        if (
+          data &&
+          typeof data === 'object' &&
+          'pages' in data &&
+          Array.isArray((data as { pages?: unknown[] }).pages)
+        ) {
+          return (data as { pages: unknown[] }).pages.flatMap((page) => collectCommentRows(page));
+        }
+        return [];
+      };
+
+      const pruneComments = (rows: Array<{ id: string; parent_id?: string }>, targetId: string) => {
+        const childrenByParent = new Map<string, string[]>();
+        for (const row of rows) {
+          if (!row.parent_id) continue;
+          const list = childrenByParent.get(row.parent_id) ?? [];
+          list.push(row.id);
+          childrenByParent.set(row.parent_id, list);
+        }
+
+        const toDelete = new Set<string>([targetId]);
+        const queue: string[] = [targetId];
+        while (queue.length > 0) {
+          const current = queue.shift();
+          if (!current) continue;
+          const children = childrenByParent.get(current) ?? [];
+          for (const childId of children) {
+            if (toDelete.has(childId)) continue;
+            toDelete.add(childId);
+            queue.push(childId);
+          }
+        }
+
+        return {
+          ids: toDelete,
+        };
+      };
+
       queryClient.setQueriesData({ queryKey: ['comments', postId] }, (old: any) => {
+        const flatRows = collectCommentRows(old);
+        const pruned = pruneComments(flatRows, commentId);
+        removedCount = Math.max(pruned.ids.size, 1);
+
         if (Array.isArray(old)) {
-          return old.filter((comment) => comment?.id !== commentId);
+          return old.filter((comment) => !pruned.ids.has(comment?.id));
         }
         if (!old?.pages) {
           return old;
@@ -589,7 +698,7 @@ export function useDeleteComment() {
           ...old,
           pages: old.pages.map((page: any) => {
             if (!Array.isArray(page)) return page;
-            return page.filter((comment) => comment?.id !== commentId);
+            return page.filter((comment) => !pruned.ids.has(comment?.id));
           }),
         };
       });
@@ -604,7 +713,7 @@ export function useDeleteComment() {
               post.id === postId
                 ? {
                     ...post,
-                    comments_count: Math.max((post.comments_count ?? 0) - 1, 0),
+                    comments_count: Math.max((post.comments_count ?? 0) - removedCount, 0),
                   }
                 : post
             ),
@@ -615,7 +724,7 @@ export function useDeleteComment() {
         if (!old) return old;
         return {
           ...old,
-          comments_count: Math.max((old.comments_count ?? 0) - 1, 0),
+          comments_count: Math.max((old.comments_count ?? 0) - removedCount, 0),
         };
       });
       queryClient.invalidateQueries({ queryKey: ['comments', postId] });
@@ -895,6 +1004,17 @@ function toggleLikeState(post: Post): Post {
   return {
     ...post,
     likes_count: currentlyLiked ? Math.max((post.likes_count ?? 0) - 1, 0) : (post.likes_count ?? 0) + 1,
+    is_liked: !currentlyLiked,
+  };
+}
+
+function toggleCommentLikeState(comment: Comment): Comment {
+  const currentlyLiked = Boolean(comment.is_liked);
+  return {
+    ...comment,
+    likes_count: currentlyLiked
+      ? Math.max((comment.likes_count ?? 0) - 1, 0)
+      : (comment.likes_count ?? 0) + 1,
     is_liked: !currentlyLiked,
   };
 }

@@ -27,7 +27,7 @@ export default function PostDetailPage() {
           Post tidak ditemukan.
         </Card>
       ) : (
-        <PostCard post={post} showFullImage />
+        <PostCard post={post} showFullImage initialCommentsOpen />
       )}
     </div>
   );
